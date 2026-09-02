@@ -720,17 +720,42 @@ SR_API void sr_input_free(const struct sr_input *in)
  */
 SR_API void sr_input_release_sdi(const struct sr_input *in)
 {
+	GSList *saved_channels, *saved_groups;
+
 	if (!in)
 		return;
 
 	/*
 	 * Run the input module's optional .cleanup() routine BEFORE
-	 * detaching the sdi. The cleanup function only accesses in->priv
-	 * (not in->sdi) in all current input modules, so it is safe to
-	 * call it while the sdi is still attached.
+	 * detaching the sdi.
+	 *
+	 * NOTE: unlike the assumption that used to be stated here, several
+	 * input modules DO touch in->sdi from their .cleanup() routine:
+	 * vcd, csv, wav, stf and protocoldata all call
+	 * keep_header_for_reread(), which MOVES sdi->channels and
+	 * sdi->channel_groups into the module's private context and leaves
+	 * the sdi members at NULL. That is the correct thing to do for
+	 * sr_input_free() (the sdi dies together with the input), but it is
+	 * wrong here: ownership of the sdi is about to be handed to the
+	 * caller, which keeps using it. Losing the channel list makes the
+	 * caller's sdi unusable (and un-freeable, leaking every channel),
+	 * so save and restore the lists around the .cleanup() call.
+	 *
+	 * The list nodes that .cleanup() moved into in->priv become
+	 * unreachable when in->priv gets released below; the sr_channel
+	 * items themselves stay alive and remain owned by the sdi, so
+	 * sr_dev_inst_free() by the caller still releases them correctly.
 	 */
+	saved_channels = in->sdi ? in->sdi->channels : NULL;
+	saved_groups = in->sdi ? in->sdi->channel_groups : NULL;
+
 	if (in->module->cleanup)
 		in->module->cleanup((struct sr_input *)in);
+
+	if (in->sdi) {
+		in->sdi->channels = saved_channels;
+		in->sdi->channel_groups = saved_groups;
+	}
 
 	/*
 	 * Detach the sdi so that it is NOT freed when we release the
