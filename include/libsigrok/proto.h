@@ -94,6 +94,7 @@ SR_API void sr_dev_inst_free(struct sr_dev_inst *sdi);
 SR_API struct sr_dev_driver *sr_dev_inst_driver_get(const struct sr_dev_inst *sdi);
 SR_API const char *sr_dev_inst_vendor_get(const struct sr_dev_inst *sdi);
 SR_API const char *sr_dev_inst_model_get(const struct sr_dev_inst *sdi);
+SR_API int sr_dev_inst_model_set(struct sr_dev_inst *sdi, const char *model);
 SR_API const char *sr_dev_inst_version_get(const struct sr_dev_inst *sdi);
 SR_API const char *sr_dev_inst_sernum_get(const struct sr_dev_inst *sdi);
 SR_API const char *sr_dev_inst_connid_get(const struct sr_dev_inst *sdi);

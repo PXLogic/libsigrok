@@ -832,6 +832,32 @@ SR_API const char *sr_dev_inst_model_get(const struct sr_dev_inst *sdi)
 }
 
 /**
+ * Set a device instance's model string.
+ *
+ * PXView extension: the virtual-session file device carries no vendor/model,
+ * so the frontend names it after the session file. The sr_dev_inst struct is
+ * opaque in the public headers, hence this setter.
+ *
+ * @param sdi Device instance to use. Must not be NULL.
+ * @param model The model string to set. Copied internally; may be NULL to
+ *              clear.
+ *
+ * @return SR_OK on success, SR_ERR_ARG on invalid arguments.
+ *
+ * @since 0.6.0
+ */
+SR_API int sr_dev_inst_model_set(struct sr_dev_inst *sdi, const char *model)
+{
+	if (!sdi)
+		return SR_ERR_ARG;
+
+	g_free(sdi->model);
+	sdi->model = model ? g_strdup(model) : NULL;
+
+	return SR_OK;
+}
+
+/**
  * Queries a device instances' version.
  *
  * @param sdi Device instance to use. Must not be NULL.
