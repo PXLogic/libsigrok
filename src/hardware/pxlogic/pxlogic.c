@@ -985,12 +985,15 @@ static int config_get(uint32_t key, GVariant **data, const struct sr_dev_inst *s
         *data = g_variant_new_uint64(devc->limit_msec);
         break;
     case SR_CONF_DEVICE_MODE:
-        /* Return int32 (not int16) so DeviceAgent::get_config_int32 can
-         * read via g_variant_get_int32 without a GLib-CRITICAL type
-         * assertion. The set side (config_set below) still reads int16,
-         * matching DSLogic/demo drivers and the view layer's
-         * set_config_int16 — the get/set paths use independent types. */
-        *data = g_variant_new_int32(devc->mode);
+        /* Return int16 to match hwdriver.c's SR_T_INT16 declaration for
+         * SR_CONF_DEVICE_MODE, consistent with the other drivers
+         * (demo/dslogic/session_driver all return int16) and with the set
+         * side below (g_variant_get_int16). Returning int32 here caused
+         * hwdriver.c's GET-path type check to log thousands of
+         * "Wrong variant type for key 'Device mode': expected 'n', got 'i'"
+         * warnings. DeviceAgent::get_config_int32 dispatches by the actual
+         * GVariant type, so int16 is still read correctly. */
+        *data = g_variant_new_int16((int16_t)devc->mode);
         break;
     case SR_CONF_CAPTURE_RATIO:
         /* Trigger position as 0..100 percent. Mirrors scilogic api.c. */
