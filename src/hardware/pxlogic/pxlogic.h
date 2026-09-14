@@ -360,8 +360,9 @@ static const uint64_t samplerates[] = {
 #define CAPS_FEATURE_LA_CH32 (1 << 11)
 #define CAPS_FEATURE_AUTO_VGAIN (1 << 12)
 
+/* PXLogic exposes a single USB interface (bNumInterfaces=1) carrying all 14
+ * endpoints. Only interface C (=0) exists; there is no interface D. */
 #define USB_INTERFACE_C 0
-#define USB_INTERFACE_D 1
 
 static const char *probe_names[] = {
     "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",  "8",  "9",  "10",

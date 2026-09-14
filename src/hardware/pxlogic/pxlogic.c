@@ -737,15 +737,21 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
     libusb_set_raw_io_default(usb->devhdl, 0);
 #endif
 
+    /* Only interface C (=0) exists on PXLogic: the device's active config
+     * declares bNumInterfaces=1 with all 14 endpoints (0x01..0x07/0x81..0x87)
+     * on that single interface. There is no interface D (=1).
+     *
+     * Historically this code also claimed USB_INTERFACE_D. That call always
+     * fails on WinUSB: winusbx_claim_interface() takes the
+     * GetAssociatedInterface(handle, iface-1) branch for iface != 0, which
+     * returns ERROR_NO_MORE_ITEMS -> LIBUSB_ERROR_NOT_FOUND for a
+     * non-existent interface. 1.4.x ignored the return value so the failure
+     * was harmless; once the check below was made strict it started aborting
+     * every device open. Since interface D is not used by any transfer path
+     * (usb_ctrl.c only uses endpoints 0x01/0x81/0x03/0x83/0x04/0x84/0x82,
+     * all on interface C), drop the claim entirely. */
     if ((ret = libusb_claim_interface(usb->devhdl, USB_INTERFACE_C)) < 0) {
         sr_err("Failed to claim interface C: %s.", libusb_error_name(ret));
-        libusb_close(usb->devhdl);
-        usb->devhdl = NULL;
-        return SR_ERR;
-    }
-    if ((ret = libusb_claim_interface(usb->devhdl, USB_INTERFACE_D)) < 0) {
-        sr_err("Failed to claim interface D: %s.", libusb_error_name(ret));
-        libusb_release_interface(usb->devhdl, USB_INTERFACE_C);
         libusb_close(usb->devhdl);
         usb->devhdl = NULL;
         return SR_ERR;
@@ -883,8 +889,8 @@ SR_PRIV int hw_usb_close(struct sr_dev_inst *sdi)
     sr_info("%s: Closing device on %d.%d interface %d.",
         sdi->driver->name, usb->bus, usb->address, USB_INTERFACE_C);
 
+    /* Only interface C is ever claimed (see hw_dev_open()). */
     libusb_release_interface(usb->devhdl, USB_INTERFACE_C);
-    libusb_release_interface(usb->devhdl, USB_INTERFACE_D);
     libusb_close(usb->devhdl);
     usb->devhdl = NULL;
 
