@@ -410,6 +410,7 @@ static void process_logic(struct context *ctx,
 static void dump_saved_values(struct context *ctx, GString **out)
 {
 	unsigned int i, j, analog_size, num_channels;
+	unsigned int idx_analog, idx_logic;
 	double sample_time_dbl;
 	uint64_t sample_time_u64;
 	float *analog_sample, value;
@@ -486,9 +487,20 @@ static void dump_saved_values(struct context *ctx, GString **out)
 					sample_time_u64, ctx->value);
 			}
 
-			for (j = 0; j < num_channels; j++) {
+			/* ctx->channels[] holds only the ENABLED channels, in their
+			 * original order, and the two sample planes are packed per
+			 * channel type (see process_analog()/process_logic(): the
+			 * column index inside a plane is the running count of channels
+			 * of that type). So j -- which walks *all* channels -- is only
+			 * a valid plane column while a single type is enabled. With
+			 * both analog and logic enabled, indexing the plane with j
+			 * reads past the end of that plane and prints values belonging
+			 * to another channel.
+			 */
+			for (j = 0, idx_analog = 0, idx_logic = 0; j < num_channels; j++) {
 				if (ctx->channels[j].ch->type == SR_CHANNEL_ANALOG) {
-					value = ctx->analog_samples[i * ctx->num_analog_channels + j];
+					value = ctx->analog_samples[i * ctx->num_analog_channels + idx_analog];
+					idx_analog++;
 					ctx->channels[j].max =
 					    fmax(value, ctx->channels[j].max);
 					ctx->channels[j].min =
@@ -497,10 +509,11 @@ static void dump_saved_values(struct context *ctx, GString **out)
 						value, ctx->value);
 				} else if (ctx->channels[j].ch->type == SR_CHANNEL_LOGIC) {
 					g_string_append_printf(*out, "%c%s",
-							       ctx->logic_samples[i * ctx->num_logic_channels + j] ? '1' : '0', ctx->value);
+							       ctx->logic_samples[i * ctx->num_logic_channels + idx_logic] ? '1' : '0', ctx->value);
+					idx_logic++;
 				} else {
 					sr_warn("Unexpected channel type: %d",
-						ctx->channels[i].ch->type);
+						ctx->channels[j].ch->type);
 				}
 			}
 
