@@ -188,23 +188,50 @@ static int init(struct sr_output *o, GHashTable *options)
 		* (ctx->num_analog_channels + ctx->num_logic_channels));
 
 	/* Once more to map the enabled channels. */
-	ctx->channel_count = g_slist_length(o->sdi->channels);
+	/*
+	 * channels_seen accumulates one "batch" per data packet and is compared
+	 * against channel_count to decide when a full sample set is available.
+	 * Both sides must therefore be expressed in the same units: the number of
+	 * channels this output will actually receive. g_slist_length(o->sdi->channels)
+	 * counts every channel in the device -- other types, and disabled ones --
+	 * while process_logic()/process_analog() only ever deliver the enabled
+	 * channels of the exported type, so the two could never match and
+	 * dump_saved_values() discarded every buffer as a "partial packet".
+	 * Count only what this module was actually set up for.
+	 */
+	ctx->channel_count = ctx->num_analog_channels + ctx->num_logic_channels;
 	for (i = 0, l = o->sdi->channels; l; l = l->next) {
 		ch = l->data;
-		if (ch->enabled) {
-			if (ch->type == SR_CHANNEL_ANALOG) {
-				ctx->channels[i].min = FLT_MAX;
-				ctx->channels[i].max = FLT_MIN;
-			} else if (ch->type == SR_CHANNEL_LOGIC) {
-				ctx->channels[i].min = 0;
-				ctx->channels[i].max = 1;
-			} else {
-				sr_warn("Unknown channel type %d.", ch->type);
-			}
-			if (ctx->label_do && ctx->label_names)
-				ctx->channels[i].label = ch->name;
-			ctx->channels[i++].ch = ch;
+		if (!ch->enabled)
+			continue;
+		if (ch->type == SR_CHANNEL_ANALOG) {
+			ctx->channels[i].min = FLT_MAX;
+			ctx->channels[i].max = FLT_MIN;
+		} else if (ch->type == SR_CHANNEL_LOGIC) {
+			ctx->channels[i].min = 0;
+			ctx->channels[i].max = 1;
+		} else {
+			/*
+			 * A type this module cannot emit (e.g. DSO = 10002). It must be
+			 * skipped *entirely*.
+			 *
+			 * ctx->channels[] is sized to num_analog + num_logic, but the
+			 * assignment below used to run for every enabled channel
+			 * regardless of type. With DSO channels enabled next to logic
+			 * (the demo device: 32 logic + 5 analog + 2 DSO) the loop wrote 39
+			 * entries into a 37-entry array -- a heap buffer overflow on every
+			 * export, reported later as 0xc0000374 in RtlFreeHeap. Skipping the
+			 * channel here also keeps ctx->channels[] a dense, type-correct
+			 * mapping, which is what process_analog()/process_logic() and
+			 * dump_saved_values() index into.
+			 */
+			sr_warn("Skipping channel %s: unsupported type %d.",
+				ch->name ? ch->name : "(unnamed)", ch->type);
+			continue;
 		}
+		if (ctx->label_do && ctx->label_names)
+			ctx->channels[i].label = ch->name;
+		ctx->channels[i++].ch = ch;
 	}
 
 	return SR_OK;
@@ -382,16 +409,29 @@ static void process_logic(struct context *ctx,
 	uint8_t *sample;
 
 	num_samples = logic->length / logic->unitsize;
-	ctx->channels_seen += ctx->logic_channel_count;
+	/*
+	 * Count the channels this module will actually emit, not every logic
+	 * channel the device happens to have (logic_channel_count includes
+	 * disabled ones). channel_count is set to num_analog + num_logic in
+	 * init(), so the two must use the same units or the dump never triggers.
+	 */
+	ctx->channels_seen += ctx->num_logic_channels;
 	sr_dbg("Logic packet had %d channels", logic->unitsize * 8);
 	if (!ctx->logic_samples) {
 		ctx->logic_samples = g_malloc(num_samples * ctx->num_logic_channels);
 		if (!ctx->num_samples)
 			ctx->num_samples = num_samples;
 	}
-	if (ctx->num_samples != num_samples)
+	if (ctx->num_samples != num_samples) {
 		sr_warn("Expecting %u samples, got %u",
 			ctx->num_samples, num_samples);
+		/*
+		 * The sample buffer is sized for the first packet's sample count and
+		 * is reused by every later packet, so a shorter packet leaves stale
+		 * rows behind. Emit only the rows this packet actually filled.
+		 */
+		ctx->num_samples = MIN(ctx->num_samples, num_samples);
+	}
 
 	for (j = ch = 0; ch < ctx->num_logic_channels; j++) {
 		if (ctx->channels[j].ch->type == SR_CHANNEL_LOGIC) {
@@ -696,16 +736,22 @@ static int receive(const struct sr_output *o,
 	case SR_DF_LOGIC:
 		*out = g_string_sized_new(512);
 		logic = packet->payload;
+		/* Samples per packet = payload bytes / bytes per sample (unitsize).
+		 * The former "/= logic->length" was a typo that always yielded 1 and
+		 * divided by zero for an empty packet. */
 		ctx->pkt_snums = logic->length;
-		ctx->pkt_snums /= logic->length;
+		ctx->pkt_snums /= logic->unitsize ? logic->unitsize : 1;
 		check_input_constraints(ctx);
 		process_logic(ctx, logic);
 		break;
 	case SR_DF_ANALOG:
 		*out = g_string_sized_new(512);
 		analog = packet->payload;
-		ctx->pkt_snums = analog->num_samples;
-		ctx->pkt_snums /= g_slist_length(analog->meaning->channels);
+		{
+			unsigned int nch = g_slist_length(analog->meaning->channels);
+			ctx->pkt_snums = analog->num_samples;
+			ctx->pkt_snums /= nch ? nch : 1;
+		}
 		check_input_constraints(ctx);
 		process_analog(ctx, analog);
 		break;
