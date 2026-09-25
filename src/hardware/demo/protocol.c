@@ -502,7 +502,6 @@ static void spi_get_bits(uint32_t bit_idx, uint32_t bit_phase,
 	uint32_t frame_num = bit_idx / SPI_FRAME_BITS;
 	uint8_t is_high = (bit_phase >= bittime / 2) ? 1 : 0;
 	uint8_t in_hold = (bit_phase < bittime / 8) ? 1 : 0;
-	uint32_t cmd_bits = SPI_FLASH_CMD_BYTES * 8;
 	uint8_t addr_low = (uint8_t)((frame_num + data_offset) & 0xFF);
 
 	if (frame_bit < SPI_FLASH_IDLE_BITS) {
@@ -573,6 +572,7 @@ static uint8_t uart_get_rx_bit(uint32_t bit_idx, uint32_t bit_phase,
 	uint32_t uart_bit = bit_idx % UART_FRAME_BITS;
 	uint32_t uart_frame = bit_idx / UART_FRAME_BITS;
 	(void)bit_phase;
+	(void)bittime;
 
 	if (uart_bit < 2)
 		return 1; /* Leading mark (stream idle before start bit) */
@@ -614,6 +614,7 @@ static uint8_t can_get_bit(uint32_t bit_idx, uint32_t bit_phase,
 	uint32_t frame_num = bit_idx / CAN_FRAME_BITS;
 	uint16_t can_id = (uint16_t)(0x100 + ((frame_num + can_id_offset) & 0x3FF));
 	(void)bit_phase;
+	(void)bittime;
 
 	if (frame_bit == 0)
 		return 0; /* SOF */
@@ -2163,7 +2164,7 @@ SR_PRIV int demo_prepare_data(int fd, int revents, void *cb_data)
 	sr_dbg("demo_prepare_data TICK #%d: stl=%p, trigger_fired=%d, "
 		"limit_samples=%" PRIu64 ", limit_msec=%" PRIu64 ", "
 		"sent_samples=%" PRIu64 ", spent_us=%" PRId64 ", "
-		"cur_samplerate=%" PRIu64 ", num_logic=%zu, num_analog=%zu, "
+		"cur_samplerate=%" PRIu64 ", num_logic=%d, num_analog=%d, "
 		"num_dso=%zu, enabled_logic=%zu, enabled_analog=%zu",
 		_demo_tick_count, (void*)devc->stl, (int)devc->trigger_fired,
 		devc->limit_samples, devc->limit_msec,
@@ -2226,7 +2227,7 @@ SR_PRIV int demo_prepare_data(int fd, int revents, void *cb_data)
 			|| (devc->num_logic_channels <= 0
 			&& devc->num_analog_channels <= 0)) {
 		sr_info("demo_prepare_data: EARLY STOP (samplerate=%" PRIu64
-			", num_logic=%zu, num_analog=%zu)",
+			", num_logic=%d, num_analog=%d)",
 			devc->cur_samplerate, devc->num_logic_channels,
 			devc->num_analog_channels);
 		sr_dev_acquisition_stop(sdi);
@@ -3335,7 +3336,7 @@ SR_PRIV int demo_receive_data_dso_file(struct sr_dev_inst *sdi)
 	struct demo_packet_buffer *pb;
 	char file_name[32];
 	unz_file_info64 info;
-	int chan_num, ch_index, ret;
+	int chan_num, ch_index;
 	uint64_t post_buf_len;
 
 	chan_num = demo_collect_enabled_channels(sdi, SR_CHANNEL_DSO,

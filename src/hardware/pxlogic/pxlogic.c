@@ -1171,7 +1171,7 @@ static int config_set(uint32_t key, GVariant *data, const struct sr_dev_inst *sd
         devc->cur_samplerate = samplerates[idx];
         devc->samples_counter = 0;
         devc->pre_index = 0;
-        sr_dbg("%s: setting samplerate to %llu", __func__,
+        sr_dbg("%s: setting samplerate to %" PRIu64, __func__,
             devc->cur_samplerate);
         ret = SR_OK;
     } else if (key == SR_CONF_LIMIT_SAMPLES) {
@@ -1182,14 +1182,14 @@ static int config_set(uint32_t key, GVariant *data, const struct sr_dev_inst *sd
         if (devc->mode == PXLOGIC_MODE_DSO && en_ch_num(sdi) == 1) {
             devc->limit_samples /= 2;
         }
-        sr_dbg("%s: setting limit_samples to %llu", __func__,
+        sr_dbg("%s: setting limit_samples to %" PRIu64, __func__,
             devc->limit_samples);
         ret = SR_OK;
     } else if (key == SR_CONF_LIMIT_MSEC) {
         devc->limit_msec = g_variant_get_uint64(data);
         devc->limit_samples = 0;
         devc->limit_samples_show = devc->limit_samples;
-        sr_dbg("%s: setting limit_msec to %llu", __func__,
+        sr_dbg("%s: setting limit_msec to %" PRIu64, __func__,
             devc->limit_msec);
         ret = SR_OK;
     } else if (key == SR_CONF_DEVICE_MODE) {
@@ -1987,7 +1987,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
     uint64_t offset = 0;
 
     devc->buf = transfer->buffer;
-    sr_info("%llu: receive_transfer(): status %d; timeout %d; received %d bytes.",
+    sr_info("%" G_GINT64_FORMAT ": receive_transfer(): status %d; timeout %d; received %d bytes.",
         g_get_monotonic_time(), transfer->status, transfer->timeout, transfer->actual_length);
 
     if (devc->acq_aborted) {
