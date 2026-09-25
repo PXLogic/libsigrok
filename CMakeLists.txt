@@ -150,10 +150,16 @@ target_include_directories(libsigrok BEFORE PUBLIC
 # by WINDOWS_EXPORT_ALL_SYMBOLS=ON below.
 # Setting -fvisibility=hidden here would hide all symbols at the compiler
 # level, and combined with empty SR_API/SR_PRIV would leave no exports.
+#
+# -fvisibility-inlines-hidden is a C++-only option. libsigrok is a C library
+# (bindings/cxx/*.cpp are not part of this target), so passing it unconditionally
+# made gcc emit one warning per translation unit -- 273 of them on Linux, which
+# drowned out the real diagnostics in CI. Guard it with a language expression so
+# it stays correct if a C++ source is ever added to the target.
 if(NOT WIN32)
     target_compile_options(libsigrok PRIVATE
         -fvisibility=hidden
-        -fvisibility-inlines-hidden
+        $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
     )
 endif()
 
