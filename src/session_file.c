@@ -242,6 +242,9 @@ SR_API int sr_session_load(struct sr_context *ctx, const char *filename,
 	char **sections, **keys, *val;
 	char channelname[SR_MAX_CHANNELNAME_LEN + 1];
 	gboolean file_has_logic;
+	char *capturefile_name = NULL; /* capturefile of the logic device section */
+	struct sr_dev_inst *cap_sdi = NULL; /* sdi owning capturefile_name */
+	gboolean have_total_samples = FALSE; /* metadata had "total samples" */
 
 	if ((ret = sr_sessionfile_check(filename)) != SR_OK)
 		return ret;
@@ -297,6 +300,9 @@ SR_API int sr_session_load(struct sr_context *ctx, const char *filename,
 					sdi = sr_session_prepare_sdi(filename, session);
 				sr_config_set(sdi, NULL, SR_CONF_CAPTUREFILE,
 						g_variant_new_string(val));
+				g_free(capturefile_name);
+				capturefile_name = g_strdup(val);
+				cap_sdi = sdi;
 				g_free(val);
 				file_has_logic = TRUE;
 			}
@@ -356,6 +362,7 @@ SR_API int sr_session_load(struct sr_context *ctx, const char *filename,
 						g_free(val);
 						sr_config_set(sdi, NULL, SR_CONF_LIMIT_SAMPLES,
 								g_variant_new_uint64(tmp_u64));
+						have_total_samples = TRUE;
 					}
 				} else if (!strcmp(keys[j], "trigger pos")) {
 					/* "trigger pos = N" — sample offset of the trigger
@@ -613,6 +620,51 @@ SR_API int sr_session_load(struct sr_context *ctx, const char *filename,
 			}
 		}
 	}
+
+	/* Upstream sigrok session files (version 1/2 "metadata") never carry a
+	 * "total samples" key. Without it the session_driver reports
+	 * limit_samples=0 and the frontend falls back to its default sample
+	 * limit (e.g. 1M), truncating the loaded capture to a fraction of the
+	 * original (e.g. 1s of a 5s capture). Upstream PulseView applies no
+	 * limit and simply streams the capture data until EOF; mirror that
+	 * behavior here by computing the sample count from the actual size of
+	 * the capture data (base file or <capturefile>-N chunks) / unitsize. */
+	if (file_has_logic && capturefile_name && cap_sdi && unitsize > 0
+			&& !have_total_samples) {
+		struct zip *data_archive = zip_open(filename, 0, NULL);
+		if (data_archive) {
+			struct zip_stat dzs;
+			uint64_t total_bytes = 0;
+			if (zip_stat(data_archive, capturefile_name, 0, &dzs) != -1) {
+				/* No chunks, just a single capture file. */
+				total_bytes = dzs.size;
+			} else {
+				int chunk = 1;
+				char chunkname[512];
+				for (;; chunk++) {
+					g_snprintf(chunkname, sizeof(chunkname), "%s-%d",
+							capturefile_name, chunk);
+					if (zip_stat(data_archive, chunkname, 0, &dzs) == -1)
+						break;
+					total_bytes += dzs.size;
+				}
+			}
+			if (total_bytes > 0) {
+				uint64_t computed = total_bytes / (uint64_t)unitsize;
+				if (computed > 0) {
+					sr_config_set(cap_sdi, NULL, SR_CONF_LIMIT_SAMPLES,
+							g_variant_new_uint64(computed));
+					sr_info("Session file has no 'total samples' key: "
+							"computed %" PRIu64 " samples from capture "
+							"data size (%" PRIu64 " bytes / unitsize %d).",
+							computed, total_bytes, unitsize);
+				}
+			}
+			zip_discard(data_archive);
+		}
+	}
+	g_free(capturefile_name);
+
 	g_strfreev(sections);
 	g_key_file_free(kf);
 
