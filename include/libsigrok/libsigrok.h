@@ -1515,6 +1515,26 @@ enum sr_configkey {
 	 * so the frontend can restore the original capture timestamp. */
 	SR_CONF_SESSION_TIME,               /* 60099 — int64 */
 
+	/*--- WCH CH32H417 Extension Keys ----------------------------------*/
+	/*
+	 * Keys used by the wch-ch32h417 driver (ported from the reference
+	 * LogicAnalyzer project's fork libsigrok). All are uint64.
+	 *
+	 * SR_CONF_THRESHOLD_VALUE_1: logic input threshold. Encoded as the
+	 *   reference driver does — either a DAC value (0..1024) or, when
+	 *   bit15 is set, "input level" (low byte 10..33).
+	 * SR_CONF_ADC_PRECISION / SR_CONF_ADC_CHANNEL: HSADC width (8/10 bit)
+	 *   and the single active ADC channel (0 or 1; the hardware supports
+	 *   only one analog channel at a time).
+	 * SR_CONF_HARDWARE_VERSION / SR_CONF_USB_VERSION: informational
+	 *   (firmware/hardware version, and 2 = USB2.0 / 3 = USB3.0).
+	 */
+	SR_CONF_THRESHOLD_VALUE_1 = 60100,  /* uint64 */
+	SR_CONF_ADC_PRECISION,              /* 60101 — uint64, 8 or 10 */
+	SR_CONF_ADC_CHANNEL,                /* 60102 — uint64, 0 or 1 */
+	SR_CONF_HARDWARE_VERSION,           /* 60103 — uint64 */
+	SR_CONF_USB_VERSION,                /* 60104 — uint64, 2 or 3 */
+
 	/* Update sr_key_info_config[] (hwdriver.c) upon changes! */
 };
 

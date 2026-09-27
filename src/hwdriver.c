@@ -465,6 +465,17 @@ static struct sr_key_info sr_key_info_config[] = {
 		"Load decoder", NULL},
 	{SR_CONF_NUM_BLOCKS, SR_T_UINT64, "num_blocks",
 		"Num blocks", NULL},
+	/* WCH CH32H417 extension keys (all uint64). */
+	{SR_CONF_THRESHOLD_VALUE_1, SR_T_UINT64, "threshold_value_1",
+		"Logic input threshold", NULL},
+	{SR_CONF_ADC_PRECISION, SR_T_UINT64, "adc_precision",
+		"ADC precision (8 or 10 bit)", NULL},
+	{SR_CONF_ADC_CHANNEL, SR_T_UINT64, "adc_channel",
+		"ADC channel (0 or 1)", NULL},
+	{SR_CONF_HARDWARE_VERSION, SR_T_UINT64, "hardware_version",
+		"Hardware version", NULL},
+	{SR_CONF_USB_VERSION, SR_T_UINT64, "usb_version",
+		"USB version (2 or 3)", NULL},
 	/* Advanced trigger configuration keys (PXView-local extension). */
 	{SR_CONF_TRIGGER_ADV_MODE, SR_T_UINT8, "trigger_adv_mode",
 		"Advanced trigger mode (0=Simple,1=Adv,2=Serial)", NULL},
