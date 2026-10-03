@@ -1058,6 +1058,87 @@ static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer)
 }
 
 /* ===========================================================================
+ * Firmware presence diagnostics
+ *
+ * A missing FX2 .fw is the single most misleading failure mode of this driver:
+ * scan() calls ezusb_upload_firmware() expecting the device to re-enumerate as
+ * "DreamSourceLab USB-based Instrument", but when the file is absent libusb has
+ * already opened the handle and never releases it. The user then sees
+ * "Unable to claim USB interface. Another program or driver has already claimed
+ * it." plus a driver error -- neither of which names the real cause.
+ *
+ * These helpers let scan()/dev_open() detect the gap BEFORE touching the
+ * device, and report the filename plus every directory that was searched.
+ * =========================================================================== */
+
+/* Look the firmware up through the very same search path libsigrok's
+ * resource_open_default() uses, so a "exists" answer here is authoritative. */
+SR_PRIV gboolean dslogic_firmware_exists(struct sr_context *sr_ctx, const char *name)
+{
+	struct sr_resource res;
+	int ret;
+
+	if (!name || !*name)
+		return FALSE;
+
+	/* sr_resource_open() dereferences ctx->resource_open_cb without a NULL
+	 * check, so guard here rather than crash on an uninitialised context. */
+	if (!sr_ctx)
+		return FALSE;
+
+	ret = sr_resource_open(sr_ctx, &res, SR_RESOURCE_FIRMWARE, name);
+	if (ret != SR_OK)
+		return FALSE;
+
+	sr_resource_close(sr_ctx, &res);
+	return TRUE;
+}
+
+/* Print every directory libsigrok searches for firmware, in order, so the user
+ * knows exactly where to drop the file. */
+static void dslogic_log_firmware_search_paths(void)
+{
+	GSList *paths, *p;
+
+	paths = sr_resourcepaths_get(SR_RESOURCE_FIRMWARE);
+	if (!paths) {
+		sr_err("    (no firmware search path configured)");
+		return;
+	}
+
+	for (p = paths; p; p = p->next)
+		sr_err("      %s", (const char *)p->data);
+
+	g_slist_free_full(paths, g_free);
+}
+
+/* Report a missing firmware file with an actionable message. Kept separate from
+ * the boolean check so the caller can decide whether to skip the device. */
+SR_PRIV void dslogic_report_missing_firmware(struct sr_context *sr_ctx,
+		const struct DSL_profile *prof, const char *name)
+{
+	(void)sr_ctx;
+
+	sr_err("========================================================");
+	sr_err("Firmware file is missing -- cannot initialize device.");
+	sr_err("  Device : %s (VID:PID %04x:%04x)",
+	       prof->model, prof->vid, prof->pid);
+	sr_err("  Missing: %s", name);
+	sr_err("");
+	sr_err("The device will not be recognized until this file is");
+	sr_err("installed. Without it the FX2 never re-enumerates and the");
+	sr_err("USB handle stays claimed, which surfaces as a bogus");
+	sr_err("\"interface already claimed\" / \"driver problem\" error.");
+	sr_err("");
+	sr_err("Place the file in any of these directories:");
+	dslogic_log_firmware_search_paths();
+	sr_err("");
+	sr_err("Or set the SIGROK_FIRMWARE_PATH environment variable to the");
+	sr_err("directory holding '%s'.", name);
+	sr_err("========================================================");
+}
+
+/* ===========================================================================
  * dslogic_* functions (called by api.c)
  * =========================================================================== */
 
@@ -1107,6 +1188,14 @@ SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi)
 	}
 
 	sr_dbg("Uploading FPGA firmware '%s'.", name);
+
+	/* Check presence first: sr_resource_open() failure below would report the
+	 * generic "Firmware not found." without naming the file or the searched
+	 * directories. */
+	if (!dslogic_firmware_exists(drvc->sr_ctx, name)) {
+		dslogic_report_missing_firmware(drvc->sr_ctx, devc->profile, name);
+		return SR_ERR;
+	}
 
 	result = sr_resource_open(drvc->sr_ctx, &bitstream,
 			SR_RESOURCE_FIRMWARE, name);
@@ -2781,11 +2870,9 @@ SR_PRIV gboolean dsl_check_conf_profile(libusb_device *dev)
 	struct libusb_device_descriptor des;
 	struct libusb_device_handle *hdl;
 	int ret;
-	gboolean bSucess;
 	unsigned char strdesc[64];
 
 	hdl = NULL;
-	bSucess = FALSE;
 
 	if ((ret = libusb_get_device_descriptor(dev, &des)) < 0) {
 		sr_err("Failed to get device descriptor: %s", libusb_error_name(ret));
@@ -2805,7 +2892,8 @@ SR_PRIV gboolean dsl_check_conf_profile(libusb_device *dev)
 		return FALSE;
 	}
 
-	if (strncmp((const char *)strdesc, "DreamSourceLab", 14)) {
+	if (strncmp((const char *)strdesc, DSL_MANUF_STRING,
+			strlen(DSL_MANUF_STRING))) {
 		libusb_close(hdl);
 		return FALSE;
 	}
@@ -2817,7 +2905,8 @@ SR_PRIV gboolean dsl_check_conf_profile(libusb_device *dev)
 		return FALSE;
 	}
 
-	if (strncmp((const char *)strdesc, "USB-based DSL Instrument v2", 27)) {
+	if (strncmp((const char *)strdesc, DSL_PROD_STRING_DSVIEW,
+			strlen(DSL_PROD_STRING_DSVIEW))) {
 		libusb_close(hdl);
 		return FALSE;
 	}

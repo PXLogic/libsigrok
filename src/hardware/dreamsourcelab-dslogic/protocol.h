@@ -787,6 +787,26 @@ SR_PRIV int dsl_setup_probes(struct sr_dev_inst *sdi, int num_probes);
 SR_PRIV const GSList *dsl_mode_list(const struct sr_dev_inst *sdi);
 SR_PRIV void dsl_adjust_samplerate(struct dev_context *devc);
 
+/* --- "has the FX2 firmware already been uploaded?" identity ---------------
+ * A device that has been flashed re-enumerates as manufacturer
+ * "DreamSourceLab" plus one of these product strings. Both must be accepted
+ * and BOTH are defined here rather than inline, because the same fact is
+ * needed in two places (scan()'s has_firmware probe and
+ * dsl_check_conf_profile()) and drifting apart is precisely what broke this
+ * driver once already.
+ *
+ *   DSL_PROD_STRING_DSVIEW -- declared by every DreamSourceLab FX2 blob this
+ *       project ships. Verified by decoding the UTF-16LE string descriptors
+ *       inside DSLogic.fw / DSLogicPro.fw / DSCope.fw / DSCope20.fw.
+ *   DSL_PROD_STRING_UPSTREAM -- declared by the older upstream sigrok
+ *       fx2 firmware (fx2lafw lineage), accepted for compatibility.
+ *
+ * Comparisons against these are exact (strcmp semantics), so the shorter
+ * upstream string does NOT match the longer DreamSourceLab one. */
+#define DSL_MANUF_STRING		"DreamSourceLab"
+#define DSL_PROD_STRING_DSVIEW		"USB-based DSL Instrument v2"
+#define DSL_PROD_STRING_UPSTREAM	"USB-based Instrument"
+
 SR_PRIV int dsl_en_ch_num(const struct sr_dev_inst *sdi);
 SR_PRIV gboolean dsl_check_conf_profile(libusb_device *dev);
 SR_PRIV int dsl_configure_probes(const struct sr_dev_inst *sdi);
@@ -863,5 +883,15 @@ SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi);
 SR_PRIV int dslogic_set_voltage_threshold(const struct sr_dev_inst *sdi, double threshold);
 SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi);
 SR_PRIV int dslogic_acquisition_stop(struct sr_dev_inst *sdi);
+
+/* --- Firmware presence diagnostics -----------------------------------------
+ * A missing FX2 .fw makes the device never re-enumerate, but libusb has
+ * already opened its handle inside scan(), so the user-visible symptom is the
+ * misleading "device busy / driver problem" pair instead of the real cause.
+ * These helpers detect the gap up-front and report it actionably.
+ */
+SR_PRIV gboolean dslogic_firmware_exists(struct sr_context *sr_ctx, const char *name);
+SR_PRIV void dslogic_report_missing_firmware(struct sr_context *sr_ctx,
+		const struct DSL_profile *prof, const char *name);
 
 #endif

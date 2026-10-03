@@ -34,6 +34,40 @@
 /* ===========================================================================
  * 1. Profile table — 25 devices (14 DSLogic + 11 DSCope)
  *    Data copied from old dsl.h supported_DSLogic[] + supported_DSCope[].
+ *
+ *    !! THE .firmware FIELD IS *NOT* PER-MODEL — READ BEFORE "FIXING" IT !!
+ *
+ *    The old fork's dsl.h listed a distinct FX2 .fw name per profile
+ *    (DSLogicPlus.fw, DSLogicU2Basic.fw, DSCopeC20.fw, ...), but those files
+ *    were never shipped by anyone: not in the upstream DreamSourceLab/DSView
+ *    repo, not in the DSView installer, not in sigrok-firmware. Copying that
+ *    table verbatim gave 25 profiles 25 different .fw names of which only
+ *    FOUR existed on disk, so 21 profiles failed their ezusb upload and the
+ *    user saw a bogus "interface already claimed / driver problem" pair.
+ *
+ *    Only four FX2 firmware blobs exist at all, and all four are 8120 bytes
+ *    (converged builds). The FX2 (Cypress CY7C68013A, 8051) firmware only
+ *    performs the USB re-enumeration; the model-specific part is the FPGA
+ *    bitstream in fpga_bit33/fpga_bit50, which stays per-profile and is
+ *    present for all 21 bitstreams. sigrok's own wiki documents the same
+ *    granularity: one fx2 firmware per family, mapped by rename:
+ *      DSLogic.fw    -> dreamsourcelab-dslogic-fx2.fw
+ *      DSLogicPro.fw -> dreamsourcelab-dslogic-pro-fx2.fw
+ *      DSCope.fw     -> dreamsourcelab-dscope-fx2.fw
+ *
+ *    Hence each profile borrows the family's surviving blob:
+ *      DSLogic family (incl. Basic/Plus/U2Basic/U3Pro/U2Pro/pgl12 variants)
+ *                                                            -> DSLogic.fw
+ *      DSLogic Pro                                             -> DSLogicPro.fw (exact)
+ *      DSCope family  (incl. B20/C20/C20P/C20B/U2B20/U2P20/
+ *                      U2B100/U3P100)                          -> DSCope20.fw
+ *      DSLogic v1 / DSCope v1 -> DSLogic.fw / DSCope.fw        (exact)
+ *
+ *    UNVERIFIED: that a family-shared fx2 blob re-enumerates every PID in
+ *    that family. This needs a real device to confirm — see the 0x0030
+ *    (DSLogic Plus, pgl12) report. If a PID still fails to enumerate, the
+ *    fix is that PID's .firmware field, NOT reverting the table to the
+ *    non-existent per-model names.
  * =========================================================================== */
 static const struct DSL_profile supported_device[] = {
 	/*
@@ -69,7 +103,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0003, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic Pro", NULL,
-	 "DSLogicPro.fw",
+	 "DSLogicPro.fw",	/* exact */
 	 "DSLogicPro.bin",
 	 "DSLogicPro.bin",
 	 {CAPS_MODE_LOGIC,
@@ -96,7 +130,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0020, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic PLus", NULL,
-	 "DSLogicPlus.fw",
+	 "DSLogic.fw",	/* family FX2 blob */
 	 "DSLogicPlus.bin",
 	 "DSLogicPlus.bin",
 	 {CAPS_MODE_LOGIC,
@@ -123,7 +157,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0021, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic Basic", NULL,
-	 "DSLogicBasic.fw",
+	 "DSLogic.fw",
 	 "DSLogicBasic.bin",
 	 "DSLogicBasic.bin",
 	 {CAPS_MODE_LOGIC,
@@ -150,7 +184,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0029, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U2Basic", NULL,
-	 "DSLogicU2Basic.fw",
+	 "DSLogic.fw",
 	 "DSLogicU2Basic.bin",
 	 "DSLogicU2Basic.bin",
 	 {CAPS_MODE_LOGIC,
@@ -177,7 +211,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002A, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U3Pro16", NULL,
-	 "DSLogicU3Pro16.fw",
+	 "DSLogic.fw",
 	 "DSLogicU3Pro16.bin",
 	 "DSLogicU3Pro16.bin",
 	 {CAPS_MODE_LOGIC,
@@ -204,7 +238,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002A, LIBUSB_SPEED_SUPER, "DreamSourceLab", "DSLogic U3Pro16", NULL,
-	 "DSLogicU3Pro16.fw",
+	 "DSLogic.fw",
 	 "DSLogicU3Pro16.bin",
 	 "DSLogicU3Pro16.bin",
 	 {CAPS_MODE_LOGIC,
@@ -231,7 +265,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002C, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U3Pro32", NULL,
-	 "DSLogicU3Pro32.fw",
+	 "DSLogic.fw",
 	 "DSLogicU3Pro32.bin",
 	 "DSLogicU3Pro32.bin",
 	 {CAPS_MODE_LOGIC,
@@ -258,7 +292,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002C, LIBUSB_SPEED_SUPER, "DreamSourceLab", "DSLogic U3Pro32", NULL,
-	 "DSLogicU3Pro32.fw",
+	 "DSLogic.fw",
 	 "DSLogicU3Pro32.bin",
 	 "DSLogicU3Pro32.bin",
 	 {CAPS_MODE_LOGIC,
@@ -285,7 +319,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002D, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U2Pro16", NULL,
-	 "DSLogicU2Pro16.fw",
+	 "DSLogic.fw",
 	 "DSLogicU2Pro16.bin",
 	 "DSLogicU2Pro16.bin",
 	 {CAPS_MODE_LOGIC,
@@ -312,7 +346,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{0x2A0E, 0x0030, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic PLus", NULL,
-	 "DSLogicPlus.fw",
+	 "DSLogic.fw",	/* family FX2 blob -- 0x0030 report, UNVERIFIED */
 	 "DSLogicPlus-pgl12.bin",
 	 "DSLogicPlus-pgl12.bin",
 	 {CAPS_MODE_LOGIC,
@@ -339,7 +373,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{0x2A0E, 0x0031, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U2Basic", NULL,
-	 "DSLogicU2Basic.fw",
+	 "DSLogic.fw",
 	 "DSLogicU2Basic-pgl12.bin",
 	 "DSLogicU2Basic-pgl12.bin",
 	 {CAPS_MODE_LOGIC,
@@ -366,7 +400,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{0x2A0E, 0x0034, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic PLus", NULL,
-	 "DSLogicPlus-pgl12-2.fw",
+	 "DSLogic.fw",
 	 "DSLogicPlus-pgl12-2.bin",
 	 "DSLogicPlus-pgl12-2.bin",
 	 {CAPS_MODE_LOGIC,
@@ -393,7 +427,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{0x2A0E, 0x0035, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSLogic U2Basic", NULL,
-	 "DSLogicU2Basic-pgl12-2.fw",
+	 "DSLogic.fw",
 	 "DSLogicU2Basic-pgl12-2.bin",
 	 "DSLogicU2Basic-pgl12-2.bin",
 	 {CAPS_MODE_LOGIC,
@@ -477,7 +511,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0022, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope B20", NULL,
-	 "DSCopeB20.fw",
+	 "DSCope20.fw",
 	 "DSCope20.bin",
 	 "DSCope20.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -504,7 +538,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0023, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope C20", NULL,
-	 "DSCopeC20.fw",
+	 "DSCope20.fw",	/* family FX2 blob */
 	 "DSCopeC20P.bin",
 	 "DSCopeC20P.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -531,7 +565,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0024, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope C20P", NULL,
-	 "DSCopeC20P.fw",
+	 "DSCope20.fw",
 	 "DSCopeC20P.bin",
 	 "DSCopeC20P.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -558,7 +592,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0025, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope C20", NULL,
-	 "DSCopeC20B.fw",
+	 "DSCope20.fw",
 	 "DSCopeC20B.bin",
 	 "DSCopeC20B.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -585,7 +619,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0026, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope U2B20", NULL,
-	 "DSCopeU2B20.fw",
+	 "DSCope20.fw",
 	 "DSCopeU2B20.bin",
 	 "DSCopeU2B20.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -612,7 +646,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0027, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope U2P20", NULL,
-	 "DSCopeU2P20.fw",
+	 "DSCope20.fw",
 	 "DSCopeU2P20.bin",
 	 "DSCopeU2P20.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -639,7 +673,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x0028, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope U2B100", NULL,
-	 "DSCopeU2B100.fw",
+	 "DSCope20.fw",
 	 "DSCopeU2B100.bin",
 	 "DSCopeU2B100.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -666,7 +700,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002B, LIBUSB_SPEED_HIGH, "DreamSourceLab", "DSCope U3P100", NULL,
-	 "DSCopeU3P100.fw",
+	 "DSCope20.fw",	/* family FX2 blob */
 	 "DSCopeU3P100.bin",
 	 "DSCopeU3P100.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -693,7 +727,7 @@ static const struct DSL_profile supported_device[] = {
 	},
 
 	{DS_VENDOR_ID, 0x002B, LIBUSB_SPEED_SUPER, "DreamSourceLab", "DSCope U3P100", NULL,
-	 "DSCopeU3P100.fw",
+	 "DSCope20.fw",
 	 "DSCopeU3P100.bin",
 	 "DSCopeU3P100.bin",
 	 {CAPS_MODE_ANALOG | CAPS_MODE_DSO,
@@ -1101,9 +1135,29 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			cg->channels = g_slist_append(cg->channels, ch);
 		}
 
-		/* Check if firmware is already loaded. */
+		/* Check if firmware is already loaded.
+		 *
+		 * Two product strings must be accepted; testing only one is what
+		 * made every already-flashed device look unflashed. See the
+		 * DSL_PROD_STRING_* definitions in protocol.h for how each was
+		 * established (the DreamSourceLab one is decoded straight out of
+		 * the shipped .fw blobs).
+		 *
+		 * The comparison is strcmp-derived (usb_match_manuf_prod() in
+		 * usb.c), i.e. exact -- it does NOT prefix-match, so the shorter
+		 * upstream string does not subsume the DreamSourceLab one. */
 		has_firmware = usb_match_manuf_prod(devlist[i],
-			"DreamSourceLab", "USB-based Instrument");
+			DSL_MANUF_STRING, DSL_PROD_STRING_DSVIEW);
+		if (!has_firmware)
+			has_firmware = usb_match_manuf_prod(devlist[i],
+				DSL_MANUF_STRING, DSL_PROD_STRING_UPSTREAM);
+		/* Fall back to the fork's own probe. Unlike usb_match_manuf_prod()
+		 * this one reports TRUE when the handle cannot be opened at all
+		 * ("maybe the device is busy; assume it matches"), which keeps a
+		 * device that is temporarily claimed by something else from being
+		 * misdiagnosed as unflashed and re-flashed. */
+		if (!has_firmware)
+			has_firmware = dsl_check_conf_profile(devlist[i]);
 
 		if (has_firmware) {
 			sr_dbg("Found a DSLogic/DSCope device.");
@@ -1113,6 +1167,28 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				libusb_get_bus_number(devlist[i]),
 				libusb_get_device_address(devlist[i]), NULL);
 		} else {
+			/* The FX2 has not been flashed yet, so it must be uploaded
+			 * now. Verify the file exists BEFORE handing the device to
+			 * libusb: ezusb_upload_firmware() on a missing file leaves
+			 * the handle claimed and the device unrenumerated, which the
+			 * user only sees as "interface already claimed" / "driver
+			 * problem" -- with no mention of the real cause. */
+			if (!dslogic_firmware_exists(drvc->sr_ctx, prof->firmware)) {
+				dslogic_report_missing_firmware(drvc->sr_ctx, prof,
+								prof->firmware);
+				/* Do NOT publish this device: it can never be
+				 * opened, and listing it would invite the user to
+				 * select it and hit the very same bogus error.
+				 * dsl_destroy_device() frees sdi->priv and
+				 * sdi->conn; sr_dev_inst_free() (called inside it)
+				 * frees channels, channel groups and the strings.
+				 * sdi->driver is still unset here, so the
+				 * dev_close() inside dsl_destroy_device() is a
+				 * no-op -- the device was never opened. */
+				dsl_destroy_device(sdi);
+				continue;
+			}
+
 			if (ezusb_upload_firmware(drvc->sr_ctx, devlist[i],
 					USB_CONFIGURATION, prof->firmware) == SR_OK) {
 				devc->fw_updated = g_get_monotonic_time();
