@@ -424,6 +424,26 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
      * 读寄存器要先 claim 接口；claim 或读失败都只回落到 logic_mode=0，
      * 绝不把设备踢出列表（旧的 1.4.9 驱动同样在 scan 阶段 claim 并读）。 */
     if (bSucess && !already_active) {
+        /* ★ claim 之前必须先关掉 RAW_IO，否则 16 字节寄存器读必然失败。
+         *
+         * 本工程用的 libusb 是 fork 版（libusb/libusb/core.c:1219），
+         * libusb_open() 里每个新 handle 的 raw_io_default 都初始化为 **1
+         * （RAW_IO 默认开启）**；winusbx_configure_endpoints() 在
+         * libusb_claim_interface() 内按这个值给所有 IN 端点设 RAW_IO 管道策略。
+         * RAW_IO 要求传输长度是端点最大包长的整数倍（USB3.0 = 1024），
+         * 而 usb_rd_reg 只读 16 字节 —— 于是 ReadPipe 直接被 WinUSB 拒绝，
+         * 报 Win32 ERROR_INVALID_FUNCTION(=1)，在 libusb 日志里就是
+         * "windows_transfer_callback detected I/O error 1"。
+         * hw_usb_open() 一直在 claim 前调用 libusb_set_raw_io_default(hdl, 0)，
+         * 所以 dev_open 的寄存器读正常；本函数漏了这一步，于是每次 scan
+         * 读 logic_mode 都失败（实测日志：每次 scan 都是
+         * "usb_rd_reg: read ep 0x81 failed: LIBUSB_ERROR_IO"）。
+         *
+         * 该 API 是 fork 独有（event-abstraction-v4），系统 libusb 没有，
+         * 故与 hw_usb_open 用同一个宏守护。 */
+#ifdef HAVE_LIBUSB_OS_HANDLE
+        libusb_set_raw_io_default(hdl, 0);
+#endif
         if (libusb_claim_interface(hdl, USB_INTERFACE_C) == 0) {
             uint32_t lm = 0;
             if (usb_rd_reg(hdl, 8192 + 22 * 4, &lm) == 0) {
@@ -889,7 +909,32 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
         uint32_t reg_data;
         reg_addr = 8192 + 13 * 4;
         ret = usb_rd_reg(usb->devhdl, reg_addr, &reg_data);
-        if (ret == 0) {
+        if (ret != 0) {
+            /* 设备刚上电 / 刚 "rst usb" 复位 / 刚被上位机升级完固件时，
+             * 寄存器通道可能还没准备好，这里重试几次再放弃。 */
+            int attempt;
+            for (attempt = 0; attempt < 5 && ret != 0; attempt++) {
+                g_usleep(100 * 1000);
+                ret = usb_rd_reg(usb->devhdl, reg_addr, &reg_data);
+            }
+            if (ret != 0) {
+                /* ★ 这里以前是"失败就跳过整个固件检查"，然后 hw_usb_open
+                 * 一路走到最后 `return SR_OK` —— 于是界面显示"已连接"，
+                 * 但设备其实没响应、FPGA bitstream 也没上传（上传被
+                 * `sdi->status == SR_ST_ACTIVE` 挡着，而 status 只有在
+                 * 本次读成功时才会置 ACTIVE）。
+                 * 后果就是日志里刷屏的
+                 * "usb_wr_reg: read ep 0x81 failed: LIBUSB_ERROR_PIPE"，
+                 * 而且必须重新插拔才能恢复。
+                 * 现在明确返回错误，让 open_by_handle 报"打开设备失败"，
+                 * 而不是连上一个假设备。 */
+                sr_err("Device not responding (firmware version register "
+                    "read failed, %s); aborting open.",
+                    libusb_error_name(ret));
+                return SR_ERR;
+            }
+        }
+        {
             sr_info("current   firmware_version = %x   new firmware_version = %x", reg_data, devc->profile->firmware_version);
             if (reg_data == devc->profile->firmware_bl_version && PXVIEW_BL_EN == 1) {
                 sr_info(" open bl bin file %s ", devc->profile->firmware_bl);
