@@ -311,7 +311,10 @@ static struct PX_context *pxlogic_dev_new(const struct PX_profile *prof)
     devc->test_mode = 0;  /* PX_TEST_NONE (fork SR_TEST_NONE removed) */
     devc->rle_mode = FALSE;
     devc->vth = 2.0;
-    devc->ch_num = 16;
+    /* 默认通道数取当前 profile 的默认通道模式，而不是硬编码 16：
+     * 32 通道设备（U3/U2 channel 32）在第一次 config_get/set 之前
+     * 若被读到 devc->ch_num，硬编码 16 会给出错误的通道数。 */
+    devc->ch_num = channel_modes[devc->ch_mode].num;
     devc->instant = FALSE;
     devc->clock_edge = 0;
     devc->ext_trig_mode = 0;
@@ -354,18 +357,47 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
 {
     struct libusb_device_descriptor des;
     struct libusb_device_handle *hdl;
+    struct drv_context *drvc;
     int ret;
     gboolean bSucess;
+    gboolean already_active;
     unsigned char strdesc[64];
+    uint8_t bus, address;
 
     hdl = NULL;
     bSucess = FALSE;
-    *logic_mode = 0;  /* scan 阶段不读取，dev_open 阶段修正 */
+    already_active = FALSE;
+    /* 读不到寄存器时回落到 logic_mode=0（表里第一个匹配项，32 通道）。
+     * 回落到 0 只是"显示/通道数不对"，不会让设备消失；dev_open 阶段
+     * claim 成功后还会再修正一次（见 hw_usb_open）。 */
+    *logic_mode = 0;
 
     if ((ret = libusb_get_device_descriptor(dev, &des)) < 0) {
         sr_err("%s:%d, Failed to get device descriptor: %s",
             __func__, __LINE__, libusb_error_name(ret));
         return FALSE;
+    }
+
+    /* 该设备是否已被本进程打开并在采集？refresh_device_list() 可在采集
+     * 过程中被调用（MCP get_devices / 设备对话框），此时不能再碰寄存器：
+     * usb_rd_reg 会往 ep 0x01 注入命令，可能干扰正在跑的采集。
+     * 这种情况只做 string descriptor 识别，logic_mode 沿用已有 profile。 */
+    drvc = di->context;
+    bus = libusb_get_bus_number(dev);
+    address = libusb_get_device_address(dev);
+    if (drvc) {
+        GSList *l;
+        for (l = drvc->instances; l; l = l->next) {
+            struct sr_dev_inst *sdi = l->data;
+            struct sr_usb_dev_inst *usb;
+            if (!sdi || sdi->status != SR_ST_ACTIVE)
+                continue;
+            usb = sdi->conn;
+            if (usb && usb->bus == bus && usb->address == address) {
+                already_active = TRUE;
+                break;
+            }
+        }
     }
 
     if ((ret = libusb_open(dev, &hdl)) < 0) {
@@ -375,16 +407,35 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
         return TRUE;
     }
 
-    /* scan 阶段只用 string descriptor 识别 PX 设备，不 claim interface
-     * 也不读寄存器（usb_rd_reg 内部调用 libusb_bulk_transfer，若设备
-     * 未正确安装 WinUSB 驱动会 SIGSEGV）。logic_mode 推迟到 dev_open
-     * 阶段（claim_interface 成功后）读取并修正 profile。 */
     if ((ret = libusb_get_string_descriptor_ascii(hdl,
              des.iManufacturer, strdesc, sizeof(strdesc))) < 0) {
         sr_err("%s:%d, Failed to get device descriptor ascii: %s",
             __func__, __LINE__, libusb_error_name(ret));
     } else if (!strncmp((const char *)strdesc, "PX", 2)) {
         bSucess = TRUE;
+    }
+
+    /* 同一 vid/pid/usb_speed 下有 ch32 / ch16 Pro / ch16 Plus / ch16 Base
+     * 多个变体，只能靠 logic_mode 寄存器（8192 + 22*4）区分。必须在 scan
+     * 阶段就读出来：hw_scan 用 logic_mode 选表项，读不到就只会选中表里
+     * 第一个（logic_mode=0）的 "channel 32" profile —— 设备列表和
+     * DeviceOptionsDock 会把 16 Pro 显示成 "PX_Tool PX-Logic U3 channel 32"，
+     * setup_probes() 也会按 32 通道建探针。
+     * 读寄存器要先 claim 接口；claim 或读失败都只回落到 logic_mode=0，
+     * 绝不把设备踢出列表（旧的 1.4.9 驱动同样在 scan 阶段 claim 并读）。 */
+    if (bSucess && !already_active) {
+        if (libusb_claim_interface(hdl, USB_INTERFACE_C) == 0) {
+            uint32_t lm = 0;
+            if (usb_rd_reg(hdl, 8192 + 22 * 4, &lm) == 0) {
+                *logic_mode = lm;
+                sr_info("scan: logic_mode = %u", lm);
+            } else {
+                sr_warn("scan: logic_mode read failed, assuming 0");
+            }
+            libusb_release_interface(hdl, USB_INTERFACE_C);
+        } else {
+            sr_warn("scan: claim interface C failed, assuming logic_mode 0");
+        }
     }
 
     if (hdl)
@@ -767,15 +818,20 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
         usb->address = libusb_get_device_address(dev_handel);
     }
 
-    /* scan 阶段未读 logic_mode，此处 claim_interface 成功后读取并修正 profile。
-     * 同一 vid/pid/usb_speed 可能有多个变体（ch32/ch16 Pro/ch16 Plus），
-     * 通过 logic_mode 寄存器区分。 */
+    /* claim_interface 成功后再读一次 logic_mode 并修正 profile。
+     * scan 阶段已经读过（logic_check_conf_profile），正常情况下这里是 no-op；
+     * 只有 scan 读失败（设备被占用 / claim 失败）时才靠这里兜底。
+     *
+     * 修正必须"整套"跟着换，否则就是 bug 现场：
+     *   - sdi->model  → DeviceOptionsDock / 设备列表显示的 "vendor + model"
+     *   - devc->ch_mode / 探针列表 → 通道数（16 Pro 曾显示成 32）
+     *   - 采样率 / 采样深度 / timebase → 都来自 profile->dev_caps
+     * 之前只改了 devc->profile，于是 16 Pro 被显示成 "PX-Logic U3 channel 32"
+     * 且通道数也是 32。 */
     {
         uint32_t lm_addr = 8192 + 22 * 4;
         uint32_t lm_data = 0;
-        sr_err("DEBUG: about to call usb_rd_reg, devhdl=%p", (void*)usb->devhdl);
         ret = usb_rd_reg(usb->devhdl, lm_addr, &lm_data);
-        sr_err("DEBUG: usb_rd_reg returned %d, lm_data=%u", ret, lm_data);
         if (ret == 0 && lm_data != devc->profile->logic_mode) {
             int k;
             for (k = 0; supported_PX[k].vid; k++) {
@@ -783,10 +839,45 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
                     supported_PX[k].pid == devc->profile->pid &&
                     supported_PX[k].usb_speed == devc->profile->usb_speed &&
                     supported_PX[k].logic_mode == lm_data) {
-                    sr_info("Corrected profile: logic_mode %d -> %d (%s)",
-                        devc->profile->logic_mode, lm_data,
-                        supported_PX[k].model);
+                    struct sr_dev_inst *mut_sdi = sdi;
+                    uint32_t old_mode = devc->profile->logic_mode;
+                    unsigned int i;
+                    int num_probes;
+
                     devc->profile = &supported_PX[k];
+                    sr_info("Corrected profile: logic_mode %u -> %u (%s)",
+                        old_mode, lm_data, devc->profile->model);
+
+                    /* 型号名（sdi->model 是扫描时写入的，必须同步） */
+                    sr_dev_inst_model_set(mut_sdi, devc->profile->model);
+
+                    /* 通道模式：取新 profile 支持的第一个当前 mode 的通道模式
+                     * （与 config_set(SR_CONF_DEVICE_MODE) 的选法一致） */
+                    for (i = 0; i < ARRAY_SIZE(channel_modes); i++) {
+                        if (channel_modes[i].mode == devc->mode &&
+                            devc->profile->dev_caps.channels & (1 << i)) {
+                            devc->ch_mode = channel_modes[i].id;
+                            break;
+                        }
+                    }
+                    num_probes = channel_modes[devc->ch_mode].num;
+                    devc->cur_samplerate = channel_modes[devc->ch_mode].default_samplerate;
+                    devc->limit_samples = channel_modes[devc->ch_mode].default_samplelimit;
+                    devc->limit_samples_show = devc->limit_samples;
+                    devc->timebase = devc->profile->dev_caps.default_timebase;
+
+                    /* 重建探针：先释放旧通道再按新数量建（setup_probes 只
+                     * 负责建，调用方负责释放，见 config_set 的同一套路） */
+                    g_slist_free_full(mut_sdi->channels, (GDestroyNotify)sr_channel_free);
+                    mut_sdi->channels = NULL;
+                    if (setup_probes(mut_sdi, num_probes) != SR_OK) {
+                        sr_err("Corrected profile: setup_probes(%d) failed",
+                            num_probes);
+                    }
+                    devc->ch_num = num_probes;
+                    adjust_samplerate(devc);
+                    sr_info("Corrected profile: %d probes, default samplerate %" PRIu64,
+                        num_probes, devc->cur_samplerate);
                     break;
                 }
             }
