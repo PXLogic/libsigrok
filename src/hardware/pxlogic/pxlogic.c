@@ -353,20 +353,86 @@ static struct PX_context *pxlogic_dev_new(const struct PX_profile *prof)
     return devc;
 }
 
+/* scan 阶段找"本进程已经打开的那台 pxlogic 设备"。
+ *
+ * 为什么需要：PXView 在设备掉线时**不关闭句柄**（SigSession 的
+ * "Hotplug: device detached" 只 refresh_device_list + 广播事件），
+ * 重新枚举后本进程仍持有同一个 Windows 设备对象，scan 里的 libusb_open
+ * 就会直接失败 —— 实测日志：
+ *   winusbx_open could not open device \\.\USB#VID_16C0&PID_05DC#... [5] 拒绝访问
+ *   → LIBUSB_ERROR_ACCESS
+ * 读不到 logic_mode 就回落成 0，设备列表于是把 16 Pro 显示成
+ * "PX-Logic U3 channel 32"（2026-10-10 rc.20 实测：拔插一次即复现）。
+ * 但这种情况我们**已经知道答案**：dev_open 阶段读出来并修正过的 profile
+ * 就挂在那个活动实例上。
+ *
+ * 两种匹配口径：
+ *   PX_OPEN_MATCH_ADDR  —— bus/address 精确匹配（同一台设备，最可靠）。
+ *   PX_OPEN_MATCH_MODEL —— vid/pid 相同且**恰好只有一个**活动实例时才算命中。
+ *                          只在 libusb_open 失败、已经没别的办法时用；
+ *                          本进程同时只会打开一台设备，所以这个兜底基本安全。
+ */
+enum px_open_match {
+    PX_OPEN_MATCH_ADDR,
+    PX_OPEN_MATCH_MODEL,
+};
+
+static struct sr_dev_inst *find_open_pxlogic_instance(struct drv_context *drvc,
+    uint8_t bus, uint8_t address, uint16_t vid, uint16_t pid,
+    enum px_open_match how)
+{
+    struct sr_dev_inst *model_hit = NULL;
+    int model_count = 0;
+    GSList *l;
+
+    if (!drvc)
+        return NULL;
+
+    for (l = drvc->instances; l; l = l->next) {
+        struct sr_dev_inst *sdi = l->data;
+        struct sr_usb_dev_inst *usb;
+        struct PX_context *c;
+
+        if (!sdi || sdi->status != SR_ST_ACTIVE)
+            continue;
+        c = sdi->priv;
+        if (!c || !c->profile)
+            continue;
+
+        usb = sdi->conn;
+        if (usb && usb->bus == bus && usb->address == address) {
+            if (how == PX_OPEN_MATCH_ADDR)
+                return sdi;
+            /* 地址命中优先于型号命中，记下来继续找 */
+            model_hit = sdi;
+            model_count = 1;
+            break;
+        }
+        if (how == PX_OPEN_MATCH_MODEL &&
+            c->profile->vid == vid && c->profile->pid == pid) {
+            model_hit = sdi;
+            model_count++;
+        }
+    }
+
+    if (how == PX_OPEN_MATCH_MODEL && model_count == 1)
+        return model_hit;
+    return NULL;
+}
+
 SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mode)
 {
     struct libusb_device_descriptor des;
     struct libusb_device_handle *hdl;
     struct drv_context *drvc;
+    struct sr_dev_inst *open_sdi;
     int ret;
     gboolean bSucess;
-    gboolean already_active;
     unsigned char strdesc[64];
     uint8_t bus, address;
 
     hdl = NULL;
     bSucess = FALSE;
-    already_active = FALSE;
     /* 读不到寄存器时回落到 logic_mode=0（表里第一个匹配项，32 通道）。
      * 回落到 0 只是"显示/通道数不对"，不会让设备消失；dev_open 阶段
      * claim 成功后还会再修正一次（见 hw_usb_open）。 */
@@ -378,32 +444,40 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
         return FALSE;
     }
 
-    /* 该设备是否已被本进程打开并在采集？refresh_device_list() 可在采集
-     * 过程中被调用（MCP get_devices / 设备对话框），此时不能再碰寄存器：
-     * usb_rd_reg 会往 ep 0x01 注入命令，可能干扰正在跑的采集。
-     * 这种情况只做 string descriptor 识别，logic_mode 沿用已有 profile。 */
     drvc = di->context;
     bus = libusb_get_bus_number(dev);
     address = libusb_get_device_address(dev);
-    if (drvc) {
-        GSList *l;
-        for (l = drvc->instances; l; l = l->next) {
-            struct sr_dev_inst *sdi = l->data;
-            struct sr_usb_dev_inst *usb;
-            if (!sdi || sdi->status != SR_ST_ACTIVE)
-                continue;
-            usb = sdi->conn;
-            if (usb && usb->bus == bus && usb->address == address) {
-                already_active = TRUE;
-                break;
-            }
-        }
+
+    /* 本进程已经开着这台设备？直接把 dev_open 阶段解析好的 profile 拿过来。
+     * 既避免读寄存器干扰正在进行的采集（usb_rd_reg 会往 ep 0x01 注入命令），
+     * 也绕开"设备掉线重枚举后 libusb_open 报 LIBUSB_ERROR_ACCESS"这条死路
+     * （详见 find_open_pxlogic_instance 的注释）。 */
+    open_sdi = find_open_pxlogic_instance(drvc, bus, address,
+        des.idVendor, des.idProduct, PX_OPEN_MATCH_ADDR);
+    if (open_sdi) {
+        struct PX_context *open_devc = open_sdi->priv;
+        *logic_mode = open_devc->profile->logic_mode;
+        sr_info("scan: device already open (bus %u addr %u); reuse logic_mode %u (%s)",
+            bus, address, *logic_mode, open_devc->profile->model);
+        return TRUE;
     }
 
     if ((ret = libusb_open(dev, &hdl)) < 0) {
         sr_err("%s:%d, Failed to open device: %s",
             __func__, __LINE__, libusb_error_name(ret));
-        /* 设备可能被占用，像 DSL 驱动那样仍加入列表，dev_open 时再处理 */
+        /* 设备可能被占用（其它进程 / WinUSB 独占），像 DSL 驱动那样仍加入
+         * 列表，dev_open 时再处理。此时若本进程恰好只开着一台同 vid/pid 的
+         * pxlogic 设备，就用它的 profile —— 总比回落成 0、把 16 Pro 显示成
+         * "channel 32" 强。 */
+        open_sdi = find_open_pxlogic_instance(drvc, bus, address,
+            des.idVendor, des.idProduct, PX_OPEN_MATCH_MODEL);
+        if (open_sdi) {
+            struct PX_context *open_devc = open_sdi->priv;
+            *logic_mode = open_devc->profile->logic_mode;
+            sr_info("scan: open failed (%s) but this pxlogic device is already "
+                "open; reuse logic_mode %u (%s)", libusb_error_name(ret),
+                *logic_mode, open_devc->profile->model);
+        }
         return TRUE;
     }
 
@@ -423,7 +497,7 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
      * setup_probes() 也会按 32 通道建探针。
      * 读寄存器要先 claim 接口；claim 或读失败都只回落到 logic_mode=0，
      * 绝不把设备踢出列表（旧的 1.4.9 驱动同样在 scan 阶段 claim 并读）。 */
-    if (bSucess && !already_active) {
+    if (bSucess) {
         /* ★ claim 之前必须先关掉 RAW_IO，否则 16 字节寄存器读必然失败。
          *
          * 本工程用的 libusb 是 fork 版（libusb/libusb/core.c:1219），
