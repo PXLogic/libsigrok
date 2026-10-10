@@ -41,6 +41,15 @@
 #define LOG_PREFIX "pxlogic"
 
 #define PXVIEW_BL_EN 0
+
+/* logic_check_conf_profile() 读不到 logic_mode 寄存器时用它标记"型号未识别"。
+ *
+ * 不能复用 0：0 是设备表里**合法**的 logic_mode（ch32 变体），复用 0 就等于
+ * "读不到就冒充 32 通道" —— 16 Pro 会被显示成 "PX-Logic U3 channel 32"。
+ * 现在读不到就记成 UNKNOWN，扫描时把型号标成 "model unknown"，
+ * 由打开设备时的 hw_usb_open() 再读一次并整套修正（型号 + 通道数 + 采样率）。 */
+#define PX_LOGIC_MODE_UNKNOWN 0xFFFFFFFFu
+
 #define NUM_TRIGGER_STAGES 16
 #define FIRMWARE_VERSION 0x56900028
 #define FIRMWARE_BL_VERSION 0x56900000
@@ -192,6 +201,11 @@ struct PX_channels {
 
 struct PX_context {
   const struct PX_profile *profile;
+  /* TRUE = scan 阶段没能读到 logic_mode，profile 只是"按 vid/pid/速度取的第一条"
+   * 占位，型号与通道数都还没确定。hw_usb_open() 读到真正的 logic_mode 后
+   * 会把它清掉并整套修正（即使读回来的值是 0，也要修正 —— 因为型号名
+   * 此刻还是 "model unknown"）。 */
+  gboolean model_unknown;
 
   int pipe_fds[2];
   GIOChannel *channel;

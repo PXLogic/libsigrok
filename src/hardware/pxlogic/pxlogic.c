@@ -300,6 +300,7 @@ static struct PX_context *pxlogic_dev_new(const struct PX_profile *prof)
     sr_info("devc->profile = prof");
     devc->channel = NULL;
     devc->profile = prof;
+    devc->model_unknown = FALSE;   /* scan 读不到 logic_mode 时会被置 TRUE */
     devc->ch_mode = devc->profile->dev_caps.default_channelmode;
     devc->cur_samplerate = channel_modes[devc->ch_mode].default_samplerate;
     devc->limit_samples = channel_modes[devc->ch_mode].default_samplelimit;
@@ -433,10 +434,11 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
 
     hdl = NULL;
     bSucess = FALSE;
-    /* 读不到寄存器时回落到 logic_mode=0（表里第一个匹配项，32 通道）。
-     * 回落到 0 只是"显示/通道数不对"，不会让设备消失；dev_open 阶段
-     * claim 成功后还会再修正一次（见 hw_usb_open）。 */
-    *logic_mode = 0;
+    /* 默认"型号未识别"。读不到寄存器时**不要**回落成 0 —— 0 是设备表里合法的
+     * logic_mode（ch32 变体），回落 0 等于冒充 32 通道机型。
+     * 置 UNKNOWN 后 scan() 会把型号标成 "model unknown"，
+     * dev_open 阶段读到真值再整套修正（见 hw_usb_open 的 model_unknown 分支）。 */
+    *logic_mode = PX_LOGIC_MODE_UNKNOWN;
 
     if ((ret = libusb_get_device_descriptor(dev, &des)) < 0) {
         sr_err("%s:%d, Failed to get device descriptor: %s",
@@ -495,7 +497,7 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
      * 第一个（logic_mode=0）的 "channel 32" profile —— 设备列表和
      * DeviceOptionsDock 会把 16 Pro 显示成 "PX_Tool PX-Logic U3 channel 32"，
      * setup_probes() 也会按 32 通道建探针。
-     * 读寄存器要先 claim 接口；claim 或读失败都只回落到 logic_mode=0，
+     * 读寄存器要先 claim 接口；claim 或读失败都只把 logic_mode 留在 UNKNOWN，
      * 绝不把设备踢出列表（旧的 1.4.9 驱动同样在 scan 阶段 claim 并读）。 */
     if (bSucess) {
         /* ★ claim 之前必须先关掉 RAW_IO，否则 16 字节寄存器读必然失败。
@@ -524,11 +526,11 @@ SR_PRIV gboolean logic_check_conf_profile(libusb_device *dev, uint32_t *logic_mo
                 *logic_mode = lm;
                 sr_info("scan: logic_mode = %u", lm);
             } else {
-                sr_warn("scan: logic_mode read failed, assuming 0");
+                sr_warn("scan: logic_mode read failed; variant stays unknown");
             }
             libusb_release_interface(hdl, USB_INTERFACE_C);
         } else {
-            sr_warn("scan: claim interface C failed, assuming logic_mode 0");
+            sr_warn("scan: claim interface C failed; variant stays unknown");
         }
     }
 
@@ -641,23 +643,38 @@ static GSList *scan(struct sr_dev_driver *driver, GSList *options)
         bus = libusb_get_bus_number(device_handle);
         address = libusb_get_device_address(device_handle);
         sr_info("Found a new device,handle:%p,bus:%d,address:%d", device_handle, bus, address);
-        uint32_t logic_mode = 0;
+        uint32_t logic_mode = PX_LOGIC_MODE_UNKNOWN;
         if (logic_check_conf_profile(device_handle, &logic_mode)) {
-            for (j = 0; supported_PX[j].vid; j++) {
-                if (des.idVendor == supported_PX[j].vid && des.idProduct == supported_PX[j].pid) {
-                    if (usb_speed == supported_PX[j].usb_speed && logic_mode == supported_PX[j].logic_mode) {
-                        prof = &supported_PX[j];
-                        sr_info("Found a PX usb: vid:0x%4x,address:0x%4x", supported_PX[j].vid, supported_PX[j].pid);
-                        break;
+            gboolean variant_unknown = (logic_mode == PX_LOGIC_MODE_UNKNOWN);
+
+            if (!variant_unknown) {
+                for (j = 0; supported_PX[j].vid; j++) {
+                    if (des.idVendor == supported_PX[j].vid && des.idProduct == supported_PX[j].pid) {
+                        if (usb_speed == supported_PX[j].usb_speed && logic_mode == supported_PX[j].logic_mode) {
+                            prof = &supported_PX[j];
+                            sr_info("Found a PX usb: vid:0x%4x,address:0x%4x", supported_PX[j].vid, supported_PX[j].pid);
+                            break;
+                        }
                     }
                 }
+            } else {
+                /* 型号未识别：prof 仍是上面按 vid/pid/速度命中的那一条，只用来取
+                 * dev_caps 建探针（scan 阶段总得给出一个通道数）。但**名字不能
+                 * 照抄** —— 照抄就是"读不到就冒充 32 通道"，正是本 bug 的根。
+                 * 打开设备时 hw_usb_open() 会再读一次并整套修正（见
+                 * devc->model_unknown）。 */
+                sr_warn("scan: logic_mode unreadable; variant unknown "
+                    "(vid 0x%04X pid 0x%04X speed %d) — listed as \"model unknown\" "
+                    "until the device is opened",
+                    des.idVendor, des.idProduct, (int)usb_speed);
             }
 
             devc = pxlogic_dev_new(prof);
-            devc->usb_speed = usb_speed;
-            sr_info("pxlogic_dev_new");
             if (!devc)
                 break;
+            devc->usb_speed = usb_speed;
+            devc->model_unknown = variant_unknown;
+            sr_info("pxlogic_dev_new");
 
             sdi = g_malloc0(sizeof(struct sr_dev_inst));
             if (sdi == NULL) {
@@ -667,7 +684,12 @@ static GSList *scan(struct sr_dev_driver *driver, GSList *options)
             }
             sdi->status = SR_ST_INITIALIZING;
             sdi->vendor = g_strdup(prof->vendor);
-            sdi->model = g_strdup(prof->model);
+            /* 型号未识别时给出中性名（PX_Tool PX-Logic U3 (model unknown)），
+             * 而不是冒用表里第一条的 "channel 32"。U3/U2 由 USB 速度可知。 */
+            sdi->model = variant_unknown
+                ? g_strdup_printf("PX-Logic %s (model unknown)",
+                      usb_speed == LIBUSB_SPEED_SUPER ? "U3" : "U2")
+                : g_strdup(prof->model);
             sdi->version = g_strdup(prof->model_version);
             sdi->inst_type = SR_INST_USB;
             sdi->driver = di;
@@ -926,7 +948,10 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
         uint32_t lm_addr = 8192 + 22 * 4;
         uint32_t lm_data = 0;
         ret = usb_rd_reg(usb->devhdl, lm_addr, &lm_data);
-        if (ret == 0 && lm_data != devc->profile->logic_mode) {
+        /* 扫描阶段读不到（model_unknown）时，即使这次读回来的 logic_mode 与
+         * 占位 profile 相同（例如它真的是 32 通道机型、值就是 0），也必须走
+         * 一次修正 —— 因为此刻型号名还是 "model unknown"，得换回真实型号。 */
+        if (ret == 0 && (lm_data != devc->profile->logic_mode || devc->model_unknown)) {
             int k;
             for (k = 0; supported_PX[k].vid; k++) {
                 if (supported_PX[k].vid == devc->profile->vid &&
@@ -939,6 +964,7 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
                     int num_probes;
 
                     devc->profile = &supported_PX[k];
+                    devc->model_unknown = FALSE;   /* 型号已确定 */
                     sr_info("Corrected profile: logic_mode %u -> %u (%s)",
                         old_mode, lm_data, devc->profile->model);
 
