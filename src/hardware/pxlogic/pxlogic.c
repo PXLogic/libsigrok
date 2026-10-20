@@ -1065,7 +1065,19 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
                 reg_data = 0;
                 ret = usb_wr_reg(usb->devhdl, reg_addr, reg_data);
                 sdi->status = SR_ST_INITIALIZING;
+                if (ret != 0) {
+                    /* 复位命令没送到设备：设备还在跑旧固件、不会重新枚举。
+                     * 这时报 SR_ERR_DEV_CLOSED（让调用方等新枚举）是在撒谎，
+                     * 调用方会白等 5 秒再失败。明确报错。 */
+                    sr_err("rst usb write failed (%d); device not reset", ret);
+                    return SR_ERR;
+                }
 
+                /* 句柄由 hw_dev_open() 在非 SR_OK 返回时统一关闭
+                 * （px_usb_close_handle）：设备即将以新 USB 设备身份重新枚举，
+                 * 本进程若继续持有复位前的 WinUSB 句柄，重扫阶段的
+                 * libusb_open 会拿到 ERROR_ACCESS_DENIED，型号退化成
+                 * "model unknown" 且再也打不开。 */
                 return SR_ERR_DEV_CLOSED;
             }
             sdi->status = SR_ST_ACTIVE;
@@ -1090,6 +1102,34 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
     return SR_OK;
 }
 
+/* 释放并关闭 USB 句柄，但**不动** sdi->status / devc 状态。幂等（句柄为 NULL
+ * 时直接返回）。
+ *
+ * 为什么需要它：hw_usb_open() 有三条"已经 libusb_open + claim 成功"的早退路径
+ * （固件版本寄存器读不出来 / app 固件下发失败 / 发出 "rst usb"），以前它们
+ * 都直接 return 而**不关句柄**。句柄于是比设备活得久：设备复位后重新枚举，
+ * 本进程却仍持有复位前那台设备的 WinUSB 文件对象，重扫时
+ * libusb_open() 得到 ERROR_ACCESS_DENIED -> LIBUSB_ERROR_ACCESS，
+ * logic_check_conf_profile() 读不到 logic_mode，设备被标成
+ * "(model unknown)"，而且之后每次打开都失败 —— 只能物理拔插。
+ *
+ * 由 hw_dev_open() 在 hw_usb_open() 返回非 SR_OK 时统一调用，一处覆盖所有
+ * 错误路径（含以后新增的）。 */
+static void px_usb_close_handle(struct sr_dev_inst *sdi)
+{
+    struct sr_usb_dev_inst *usb;
+
+    if (!sdi)
+        return;
+    usb = sdi->conn;
+    if (!usb || !usb->devhdl)
+        return;
+
+    libusb_release_interface(usb->devhdl, USB_INTERFACE_C);
+    libusb_close(usb->devhdl);
+    usb->devhdl = NULL;
+}
+
 static int hw_dev_open(struct sr_dev_inst *sdi)
 {
     struct PX_context *const devc = sdi->priv;
@@ -1103,6 +1143,11 @@ static int hw_dev_open(struct sr_dev_inst *sdi)
 
     ret = hw_usb_open(di, sdi, &fpga_done);
     sr_info("hw_dev_open (ret=%d)", ret);
+
+    /* 句柄清理的唯一收口点：hw_usb_open() 的任何失败都可能留下一个已
+     * claim 的句柄（见 px_usb_close_handle 的注释）。 */
+    if (ret != SR_OK)
+        px_usb_close_handle(sdi);
 
     /* Propagate hw_usb_open's status. Previously this function always
      * returned SR_OK even when firmware loading failed, which left
