@@ -200,26 +200,27 @@ static gboolean stream_pxv_logic_data(struct sr_dev_inst *sdi)
 		return TRUE;
 	}
 
-	/* Interleave per-channel bitmaps into upstream unitsize-packed format.
-	 * PXView stores 1 bit per sample per channel (LSB-first in each byte).
-	 * Upstream expects all channels packed: channel c's bit at byte
-	 * (s*unitsize + c/8), bit (c%8), where c is the channel index. */
+	/* 性能飞跃改造：改用 PXLogic 原生 LA_CROSS_DATA 通道直通格式！
+	 * PXL 内部是以 L-<ch>/<block> 单通道位图存储的 (每个字节 8 个样本，LSB-first)。
+	 * 硬件 DMA/CROSS 规范要求：以 64 个 sample (8 字节) 为一组，
+	 * 布局为: [ch0 8B][ch1 8B]...[chN-1 8B][ch0 下个8B]...
+	 * 之前在此处进行逐 sample (s=0..samples) 的逐 bit 循环重排交织，需要数十亿次移位指令；
+	 * 改用 uint64_t 块搬移拼成 LA_CROSS_DATA 后，LogicSnapshot::append_cross_payload
+	 * 可以直接走 64-bit blocked-transpose 纯内存写入，彻底避开两端的位转置瓶颈！
+	 */
 	samples_in_block = block_size * 8;
-	out_size = samples_in_block * unitsize;
+	const int num_groups = block_size / 8; // 每组 64 samples (8 字节)
+	out_size = num_groups * ch_count * 8;
 	out_buf = g_malloc0(out_size);
 
-	for (int s = 0; s < samples_in_block; s++) {
-		int src_byte = s / 8;
-		int src_bit = s % 8;
+	uint64_t *dst_u64 = (uint64_t *)out_buf;
+	for (int g = 0; g < num_groups; g++) {
 		for (ch_ordinal = 0; ch_ordinal < ch_count; ch_ordinal++) {
-			if (!channel_bufs[ch_ordinal])
-				continue;
-			int ch_idx = channel_indices[ch_ordinal];
-			uint8_t bit_val =
-				(channel_bufs[ch_ordinal][src_byte] >> src_bit) & 1;
-			if (bit_val) {
-				int dst_byte = s * unitsize + ch_idx / 8;
-				out_buf[dst_byte] |= (1 << (ch_idx % 8));
+			if (channel_bufs[ch_ordinal]) {
+				const uint64_t *src_u64 = (const uint64_t *)(channel_bufs[ch_ordinal] + g * 8);
+				*dst_u64++ = *src_u64;
+			} else {
+				*dst_u64++ = 0;
 			}
 		}
 	}
@@ -228,7 +229,8 @@ static gboolean stream_pxv_logic_data(struct sr_dev_inst *sdi)
 	packet.type = SR_DF_LOGIC;
 	packet.payload = &logic;
 	logic.length = out_size;
-	logic.unitsize = unitsize;
+	logic.unitsize = 1;
+	logic.format = LA_CROSS_DATA;
 	logic.data = out_buf;
 	vdev->bytes_read += out_size;
 	sr_session_send(sdi, &packet);
