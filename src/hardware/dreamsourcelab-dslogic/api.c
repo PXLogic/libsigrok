@@ -960,6 +960,44 @@ static gboolean is_plausible(const struct libusb_device_descriptor *des,
 /* ===========================================================================
  * 4. scan()
  * =========================================================================== */
+
+/* Which FX2 renumeration blob may be uploaded to a given PID.
+ *
+ * A .fw blob carries a *fixed* USB device descriptor: reading the descriptors
+ * straight out of the shipped blobs gives DSLogic.fw=2A0E:0001,
+ * DSLogicPro.fw=0003, DSCope.fw=0002, DSCope20.fw=0004, and
+ * ezusb_upload_firmware() only pushes those bytes into the FX2 -- so the device
+ * re-enumerates with the PID baked into the blob, not with the PID it had.
+ *
+ * The per-model names in supported_device[] (DSLogicPlus.fw,
+ * DSLogicU2Basic-pgl12-2.fw, ...) are therefore legacy entries whose files do
+ * not exist: neither in this repository nor in the official DSView package,
+ * whose res/ directory holds exactly the same four blobs. Uploading
+ * DSLogic.fw to e.g. a 0x0030 board would re-enumerate it as 0x0001 -- the
+ * 0x0030 instance could then never be opened, and a later rescan would list it
+ * as "DSLogic" and configure PGL12 hardware with DSLogic33.bin. So only the
+ * four PIDs that have a matching blob may be flashed; everything else is
+ * reported and skipped. */
+static gboolean dslogic_fx2_blob_for_pid(uint16_t pid, const char **name)
+{
+	switch (pid) {
+	case 0x0001:	/* DSLogic */
+		*name = "DSLogic.fw";
+		return TRUE;
+	case 0x0002:	/* DSCope */
+		*name = "DSCope.fw";
+		return TRUE;
+	case 0x0003:	/* DSLogic Pro */
+		*name = "DSLogicPro.fw";
+		return TRUE;
+	case 0x0004:	/* DSCope20 */
+		*name = "DSCope20.fw";
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
 {
 	struct drv_context *drvc;
@@ -1167,15 +1205,33 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				libusb_get_bus_number(devlist[i]),
 				libusb_get_device_address(devlist[i]), NULL);
 		} else {
+			const char *fx2_blob = NULL;
+
+			/* Only the four PIDs with a matching blob may be flashed; see
+			 * dslogic_fx2_blob_for_pid(). The rest of the table names
+			 * .fw files that nobody ships, and uploading one of the four
+			 * blobs instead would re-enumerate the device under a
+			 * different PID (details in that function's comment). */
+			if (!dslogic_fx2_blob_for_pid(prof->pid, &fx2_blob)) {
+				sr_err("%s (%04X:%04X) is not running its application "
+				       "firmware, and PXView ships no FX2 renumeration "
+				       "blob for this PID (only DSLogic.fw / "
+				       "DSLogicPro.fw / DSCope.fw / DSCope20.fw exist, each "
+				       "with a different baked-in PID). Skipping the device.",
+				       prof->model, prof->vid, prof->pid);
+				dsl_destroy_device(sdi);
+				continue;
+			}
+
 			/* The FX2 has not been flashed yet, so it must be uploaded
 			 * now. Verify the file exists BEFORE handing the device to
 			 * libusb: ezusb_upload_firmware() on a missing file leaves
 			 * the handle claimed and the device unrenumerated, which the
 			 * user only sees as "interface already claimed" / "driver
 			 * problem" -- with no mention of the real cause. */
-			if (!dslogic_firmware_exists(drvc->sr_ctx, prof->firmware)) {
+			if (!dslogic_firmware_exists(drvc->sr_ctx, fx2_blob)) {
 				dslogic_report_missing_firmware(drvc->sr_ctx, prof,
-								prof->firmware);
+								fx2_blob);
 				/* Do NOT publish this device: it can never be
 				 * opened, and listing it would invite the user to
 				 * select it and hit the very same bogus error.
@@ -1190,14 +1246,14 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			}
 
 			if (ezusb_upload_firmware(drvc->sr_ctx, devlist[i],
-					USB_CONFIGURATION, prof->firmware) == SR_OK) {
+					USB_CONFIGURATION, fx2_blob) == SR_OK) {
 				devc->fw_updated = g_get_monotonic_time();
 			} else {
 				sr_err("Firmware upload failed for "
 				       "device %d.%d (logical), name %s.",
 				       libusb_get_bus_number(devlist[i]),
 				       libusb_get_device_address(devlist[i]),
-				       prof->firmware);
+				       fx2_blob);
 			}
 			sdi->inst_type = SR_INST_USB;
 			sdi->conn = sr_usb_dev_inst_new(
@@ -1219,13 +1275,12 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 static int dev_open(struct sr_dev_inst *sdi)
 {
 	struct sr_dev_driver *di = sdi->driver;
-	struct sr_usb_dev_inst *usb;
 	struct dev_context *devc;
 	int ret;
 	int64_t timediff_us, timediff_ms;
+	gboolean fpga_done = FALSE;
 
 	devc = sdi->priv;
-	usb = sdi->conn;
 
 	/*
 	 * If the firmware was recently uploaded, wait up to MAX_RENUM_DELAY_MS
@@ -1237,7 +1292,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 		g_usleep(300 * 1000);
 		timediff_ms = 0;
 		while (timediff_ms < MAX_RENUM_DELAY_MS) {
-			if ((ret = dslogic_dev_open(sdi, di)) == SR_OK)
+			if ((ret = dsl_dev_open(di, sdi, &fpga_done)) == SR_OK)
 				break;
 			g_usleep(100 * 1000);
 
@@ -1252,34 +1307,13 @@ static int dev_open(struct sr_dev_inst *sdi)
 		sr_info("Device came back after %" PRIi64 "ms.", timediff_ms);
 	} else {
 		sr_info("Firmware upload was not needed.");
-		ret = dslogic_dev_open(sdi, di);
+		ret = dsl_dev_open(di, sdi, &fpga_done);
 	}
 
 	if (ret != SR_OK) {
 		sr_err("Unable to open device.");
 		return SR_ERR;
 	}
-
-	ret = libusb_claim_interface(usb->devhdl, USB_INTERFACE);
-	if (ret != 0) {
-		switch (ret) {
-		case LIBUSB_ERROR_BUSY:
-			sr_err("Unable to claim USB interface. Another "
-			       "program or driver has already claimed it.");
-			break;
-		case LIBUSB_ERROR_NO_DEVICE:
-			sr_err("Device has been disconnected.");
-			break;
-		default:
-			sr_err("Unable to claim interface: %s.",
-			       libusb_error_name(ret));
-			break;
-		}
-		return SR_ERR;
-	}
-
-	if ((ret = dslogic_fpga_firmware_upload(sdi)) != SR_OK)
-		return ret;
 
 	if (devc->cur_samplerate == 0)
 		devc->cur_samplerate = devc->profile->dev_caps.default_samplerate;

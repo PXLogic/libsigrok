@@ -814,6 +814,7 @@ SR_PRIV uint64_t dsl_channel_depth(const struct sr_dev_inst *sdi);
 
 SR_PRIV int dsl_wr_reg(const struct sr_dev_inst *sdi, uint8_t addr, uint8_t value);
 SR_PRIV int dsl_rd_reg(const struct sr_dev_inst *sdi, uint8_t addr, uint8_t *value);
+SR_PRIV int dsl_hdl_version(const struct sr_dev_inst *sdi, uint8_t *value);
 SR_PRIV int dsl_wr_ext(const struct sr_dev_inst *sdi, uint8_t addr, uint8_t value);
 SR_PRIV int dsl_rd_ext(const struct sr_dev_inst *sdi, unsigned char *ctx, uint16_t addr, uint8_t len);
 
@@ -831,8 +832,9 @@ SR_PRIV int dsl_skew_fpga_fgain(const struct sr_dev_inst *sdi, gboolean comb, do
 SR_PRIV int dsl_probe_cali_fgain(struct dev_context *devc, struct sr_channel *probe, double mean, gboolean comb, gboolean reset);
 SR_PRIV gboolean dsl_probe_fgain_inrange(struct sr_channel *probe, gboolean comb, double skew[]);
 
+SR_PRIV const char *get_fpga_bitstream_name(const struct sr_dev_inst *sdi);
 SR_PRIV int dsl_fpga_arm(const struct sr_dev_inst *sdi);
-SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filename);
+SR_PRIV int dsl_fpga_config(const struct sr_dev_inst *sdi, const char *name);
 
 /* DSO command IDs for dslogic_dso_cmd_gen() (fork-only, not upstream SR_CONF_*). */
 #define DSO_CMD_PROBE_VDIV		0x1001

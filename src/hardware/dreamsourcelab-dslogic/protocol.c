@@ -187,19 +187,18 @@ static int command_get_revid_version(struct sr_dev_inst *sdi, uint8_t *revid)
 
 static int command_start_acquisition(const struct sr_dev_inst *sdi)
 {
-	struct sr_usb_dev_inst *usb;
-	struct cmd_start_acquisition mode;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct ctl_wr_cmd wr_cmd;
 	int ret;
 
-	mode.flags = DS_START_FLAGS_MODE_LA | DS_START_FLAGS_SAMPLE_WIDE;
-	mode.sample_delay_h = mode.sample_delay_l = 0;
+	wr_cmd.header.dest = DSL_CTL_START;
+	wr_cmd.header.offset = 0;
+	wr_cmd.header.size = 0;
 
-	usb = sdi->conn;
-	ret = libusb_control_transfer(usb->devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-			LIBUSB_ENDPOINT_OUT, DS_CMD_START, 0x0000, 0x0000,
-			(unsigned char *)&mode, sizeof(mode), USB_TIMEOUT);
-	if (ret < 0) {
-		sr_err("Failed to send start command: %s.", libusb_error_name(ret));
+	ret = command_ctl_wr(usb->devhdl, wr_cmd);
+	if (ret != SR_OK) {
+		sr_err("Failed to send start acquisition command: %s.",
+		       libusb_error_name(ret));
 		return SR_ERR;
 	}
 
@@ -208,19 +207,18 @@ static int command_start_acquisition(const struct sr_dev_inst *sdi)
 
 static int command_stop_acquisition(const struct sr_dev_inst *sdi)
 {
-	struct sr_usb_dev_inst *usb;
-	struct cmd_start_acquisition mode;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct ctl_wr_cmd wr_cmd;
 	int ret;
 
-	mode.flags = DS_START_FLAGS_STOP;
-	mode.sample_delay_h = mode.sample_delay_l = 0;
+	wr_cmd.header.dest = DSL_CTL_STOP;
+	wr_cmd.header.offset = 0;
+	wr_cmd.header.size = 0;
 
-	usb = sdi->conn;
-	ret = libusb_control_transfer(usb->devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-			LIBUSB_ENDPOINT_OUT, DS_CMD_START, 0x0000, 0x0000,
-			(unsigned char *)&mode, sizeof(mode), USB_TIMEOUT);
-	if (ret < 0) {
-		sr_err("Failed to send stop command: %s.", libusb_error_name(ret));
+	ret = command_ctl_wr(usb->devhdl, wr_cmd);
+	if (ret != SR_OK) {
+		sr_err("Failed to send stop acquisition command: %s.",
+		       libusb_error_name(ret));
 		return SR_ERR;
 	}
 
@@ -258,7 +256,7 @@ static uint16_t enabled_channel_mask(const struct sr_dev_inst *sdi)
  * accordingly.
  * @return @c true if any triggers are enabled, @c false otherwise.
  */
-static bool set_trigger(const struct sr_dev_inst *sdi, struct fpga_config *cfg)
+G_GNUC_UNUSED static bool set_trigger(const struct sr_dev_inst *sdi, struct fpga_config *cfg)
 {
 	struct sr_trigger *trigger;
 	struct sr_trigger_stage *stage;
@@ -345,7 +343,7 @@ static bool set_trigger(const struct sr_dev_inst *sdi, struct fpga_config *cfg)
 	return num_trigger_stages != 0;
 }
 
-static int fpga_configure(const struct sr_dev_inst *sdi)
+G_GNUC_UNUSED static int fpga_configure(const struct sr_dev_inst *sdi)
 {
 	const struct dev_context *const devc = sdi->priv;
 	const struct sr_usb_dev_inst *const usb = sdi->conn;
@@ -462,6 +460,10 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	g_free(devc->transfers);
 	g_free(devc->deinterleave_buffer);
 	devc->deinterleave_buffer = NULL;
+
+	/* 1.3.2 finish_acquisition() (dsl.c:2262) ends in DSL_FINISH; the stop
+	 * path keys its "already finished -> send DSL_CTL_STOP" branch on it. */
+	devc->status = DSL_FINISH;
 }
 
 static void free_transfer(struct libusb_transfer *transfer)
@@ -545,6 +547,10 @@ static void send_data(struct sr_dev_inst *sdi,
  * which is defined later in the transfer-management section. */
 static size_t to_bytes_per_ms(const struct sr_dev_inst *sdi);
 static size_t get_buffer_size(const struct sr_dev_inst *sdi);
+/* start_transfers() submits the trigger packet as slot 0, so it needs the
+ * callback declared before it (defined further down, after the transfer
+ * bookkeeping helpers it relies on). */
+static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer);
 
 /* ===========================================================================
  * get_measure() — parse DSO status header from USB transfer buffer.
@@ -654,6 +660,17 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	sr_dbg("receive_transfer(): status %s received %d bytes.",
 		libusb_error_name(transfer->status), transfer->actual_length);
 
+	/* Acquisition state machine, aligned with receive_transfer() in the
+	 * 1.3.2 reference (dsl.c:2320-2324): the first data buffer after
+	 * DSL_CTL_START promotes DSL_START to DSL_DATA (the trigger packet and
+	 * the data share endpoint 6, so buffer order is not guaranteed), and an
+	 * aborted acquisition moves to DSL_STOP so buffers are dropped instead
+	 * of resubmitted. */
+	if (devc->status == DSL_START)
+		devc->status = DSL_DATA;
+	if (devc->abort)
+		devc->status = DSL_STOP;
+
 	/* Save incoming transfer before reusing the transfer struct. */
 
 	switch (transfer->status) {
@@ -684,6 +701,17 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		return;
 	} else {
 		devc->empty_transfer_count = 0;
+	}
+
+	/* Only forward once the trigger packet has armed the acquisition: until
+	 * then devc->trigger_pos is unknown and forwarding would misplace the
+	 * trigger marker. Anything that is not DSL_DATA at this point (aborted,
+	 * trigger packet error, already finished) is drained instead of
+	 * resubmitted -- 1.3.2 does the same with
+	 * "if (status == DSL_DATA) resubmit else free" (dsl.c:2433-2436). */
+	if (devc->status != DSL_DATA) {
+		free_transfer(transfer);
+		return;
 	}
 
 	/* ===================================================================
@@ -857,12 +885,21 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			(DSLOGIC_ATOMIC_SIZE * channel_count);
 		unsigned int num_samples;
 		int trigger_offset;
+		/* Capture length that will actually arrive. Normally limit_samples
+		 * rounded up to the 64-sample atomic unit; when the trigger packet
+		 * reported remaining samples (device stopped early) actual_samples
+		 * is smaller and is the real end -- 1.3.2 clips to actual_bytes
+		 * (dsl.c:2399-2418), we clip to the same sample count without
+		 * ever exceeding what the frontend asked for. */
+		const uint64_t total_samples =
+			(devc->actual_samples && devc->actual_samples < devc->limit_samples) ?
+			devc->actual_samples : devc->limit_samples;
 
 		/* Loop mode: skip limit_samples clipping — data flows continuously
 		 * until user stops, matching demo/pxlogic's loop_mode behavior. */
-		if (devc->is_loop || !devc->limit_samples || devc->sent_samples < devc->limit_samples) {
-			if (!devc->is_loop && devc->limit_samples && devc->sent_samples + cur_sample_count > devc->limit_samples)
-				num_samples = devc->limit_samples - devc->sent_samples;
+		if (devc->is_loop || !total_samples || devc->sent_samples < total_samples) {
+			if (!devc->is_loop && total_samples && devc->sent_samples + cur_sample_count > total_samples)
+				num_samples = total_samples - devc->sent_samples;
 			else
 				num_samples = cur_sample_count;
 
@@ -896,7 +933,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		/* Stop condition: in loop mode, data flows forever until user stops
 		 * (matching demo/pxlogic loop_mode behavior). Without this, DSL would
 		 * abort at limit_samples even when is_loop is set. */
-		if (!devc->is_loop && devc->limit_samples && devc->sent_samples >= devc->limit_samples) {
+		if (!devc->is_loop && total_samples && devc->sent_samples >= total_samples) {
 			abort_acquisition(devc);
 			free_transfer(transfer);
 		} else {
@@ -974,6 +1011,7 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	struct dev_context *devc;
 	struct sr_usb_dev_inst *usb;
 	struct libusb_transfer *transfer;
+	struct dsl_trigger_pos *tpos;
 	unsigned int i;
 	int ret;
 	unsigned char *buf;
@@ -986,12 +1024,20 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	devc->empty_transfer_count = 0;
 	devc->submitted_transfers = 0;
 
+	/* One extra slot for the trigger/status packet, which is submitted
+	 * together with the data transfers and before DSL_CTL_START -- the
+	 * ordering used by dsl_start_transfers() in the 1.3.2 reference
+	 * (dsl.c:2497-2570). Submitting it here (instead of from
+	 * trigger_receive()) is what keeps stream mode from losing the first
+	 * buffers: the device starts pushing data as soon as START is written,
+	 * so the IN transfers must already be queued. */
 	g_free(devc->transfers);
-	devc->transfers = g_try_malloc0(sizeof(*devc->transfers) * num_transfers);
+	devc->transfers = g_try_malloc0(sizeof(*devc->transfers) * (num_transfers + 1));
 	if (!devc->transfers) {
 		sr_err("USB transfers malloc failed.");
 		return SR_ERR_MALLOC;
 	}
+	devc->num_transfers = num_transfers + 1;
 
 	devc->deinterleave_buffer = g_try_malloc(DSLOGIC_ATOMIC_SAMPLES *
 		(size / (channel_count * DSLOGIC_ATOMIC_SIZE)) * sizeof(uint16_t));
@@ -1002,10 +1048,27 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 		return SR_ERR_MALLOC;
 	}
 
-	devc->num_transfers = num_transfers;
+	/* Slot 0: the trigger/status packet (a whole status window: 512 B on
+	 * USB2, 1 KiB on USB3 -- see dsl_header_size()). */
+	tpos = g_malloc(dsl_header_size(devc));
+	transfer = libusb_alloc_transfer(0);
+	libusb_fill_bulk_transfer(transfer, usb->devhdl,
+			6 | LIBUSB_ENDPOINT_IN, (unsigned char *)tpos,
+			dsl_header_size(devc), trigger_receive, (void *)sdi, 0);
+	if ((ret = libusb_submit_transfer(transfer)) != 0) {
+		sr_err("Failed to request trigger: %s.", libusb_error_name(ret));
+		libusb_free_transfer(transfer);
+		g_free(tpos);
+		return SR_ERR;
+	}
+	devc->transfers[0] = transfer;
+	devc->submitted_transfers++;
+
+	/* Slots 1..N: sample data. */
 	for (i = 0; i < num_transfers; i++) {
 		if (!(buf = g_try_malloc(size))) {
 			sr_err("USB transfer buffer malloc failed.");
+			abort_acquisition(devc);
 			return SR_ERR_MALLOC;
 		}
 		transfer = libusb_alloc_transfer(0);
@@ -1021,11 +1084,12 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 			abort_acquisition(devc);
 			return SR_ERR;
 		}
-		devc->transfers[i] = transfer;
+		devc->transfers[i + 1] = transfer;
 		devc->submitted_transfers++;
 	}
 
-	std_session_send_df_header(sdi);
+	/* SR_DF_HEADER is sent by the caller after DSL_CTL_START, matching
+	 * dev_acquisition_start() in the 1.3.2 reference (dslogic.c:1509). */
 
 	return SR_OK;
 }
@@ -1035,26 +1099,62 @@ static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer)
 	const struct sr_dev_inst *sdi;
 	struct dsl_trigger_pos *tpos;
 	struct dev_context *devc;
+	uint64_t remain_cnt;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
-	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-		sr_dbg("Trigger transfer canceled.");
-		/* Terminate session. */
-		std_session_send_df_end(sdi);
-		usb_source_remove(sdi->session, devc->ctx);
-		devc->num_transfers = 0;
-		g_free(devc->transfers);
-		devc->transfers = NULL;
-	} else if (transfer->status == LIBUSB_TRANSFER_COMPLETED
-			&& transfer->actual_length == sizeof(struct dsl_trigger_pos)) {
-		tpos = (struct dsl_trigger_pos *)transfer->buffer;
-		sr_info("tpos real_pos %d ram_saddr %d cnt_h %d cnt_l %d", tpos->real_pos,
-			tpos->ram_saddr, tpos->remain_cnt_h, tpos->remain_cnt_l);
-		devc->trigger_pos = tpos->real_pos;
-		start_transfers(sdi);
+	tpos = (struct dsl_trigger_pos *)transfer->buffer;
+
+	/* Ported from receive_header() in the 1.3.2 reference (dsl.c:2441-2495).
+	 *
+	 * The packet is a whole status window (512 B on USB2, 1 KiB on USB3),
+	 * carries the TRIG_CHECKID magic, and reports how many samples the FPGA
+	 * did *not* capture. That remain_cnt is the only way to learn the real
+	 * capture length when the device stops early (trigger never fired, user
+	 * aborted): without it the frontend waits for limit_samples that never
+	 * arrive and only gives up after MAX_EMPTY_POLL empty transfers.
+	 *
+	 * Once the packet is accepted the acquisition is armed (DSL_DATA) and
+	 * the data transfers submitted by start_transfers() start being
+	 * forwarded. 1.3.2 signals this with an SR_DF_TRIGGER packet; upstream
+	 * libsigrok's SR_DF_TRIGGER carries no payload, so the position is kept
+	 * in devc->trigger_pos and emitted inline by the LOGIC path. */
+	if (devc->status != DSL_ABORT)
+		devc->status = DSL_ERROR;
+
+	if (!devc->abort && transfer->status == LIBUSB_TRANSFER_COMPLETED &&
+			tpos->check_id == TRIG_CHECKID) {
+		remain_cnt = tpos->remain_cnt_h;
+		remain_cnt = (remain_cnt << 32) + tpos->remain_cnt_l;
+		sr_info("tpos real_pos %d ram_saddr %d cnt_h %d cnt_l %d",
+			tpos->real_pos, tpos->ram_saddr,
+			tpos->remain_cnt_h, tpos->remain_cnt_l);
+		if (transfer->actual_length == dsl_header_size(devc)) {
+			if (devc->mode != DSL_MODE_LOGIC || devc->stream ||
+					remain_cnt < devc->limit_samples) {
+				if (devc->mode == DSL_MODE_LOGIC &&
+						(!devc->stream || devc->status == DSL_ABORT) &&
+						dsl_en_ch_num(sdi) > 0) {
+					devc->actual_samples =
+						(devc->limit_samples - remain_cnt) & ~SAMPLES_ALIGN;
+					devc->actual_bytes = devc->actual_samples /
+						DSLOGIC_ATOMIC_SAMPLES *
+						dsl_en_ch_num(sdi) * DSLOGIC_ATOMIC_SIZE;
+					devc->actual_samples = devc->actual_bytes /
+						dsl_en_ch_num(sdi) * 8;
+				}
+				devc->trigger_pos = tpos->real_pos;
+				devc->status = DSL_DATA;
+			}
+		}
+	} else if (!devc->abort) {
+		sr_err("Trigger packet data error.");
 	}
-	libusb_free_transfer(transfer);
+
+	/* Also handles the cancelled case: the trigger transfer is slot 0 of
+	 * devc->transfers, so the usual bookkeeping (submitted_transfers--,
+	 * finish_acquisition() when the last one is gone) applies. */
+	free_transfer(transfer);
 }
 
 /* ===========================================================================
@@ -1142,32 +1242,24 @@ SR_PRIV void dslogic_report_missing_firmware(struct sr_context *sr_ctx,
  * dslogic_* functions (called by api.c)
  * =========================================================================== */
 
-SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi)
+SR_PRIV const char *get_fpga_bitstream_name(const struct sr_dev_inst *sdi)
 {
-	const char *name = NULL;
-	uint64_t sum;
-	struct sr_resource bitstream;
-	struct drv_context *drvc;
 	struct dev_context *devc;
-	struct sr_usb_dev_inst *usb;
-	unsigned char *buf;
-	ssize_t chunksize;
-	int transferred;
-	int result, ret;
-	const uint8_t cmd[3] = {0, 0, 0};
+	const char *name = NULL;
 
-	drvc = sdi->driver->context;
+	if (!sdi || !sdi->priv)
+		return NULL;
+
 	devc = sdi->priv;
-	usb = sdi->conn;
-
-	/* Prefer the per-profile fpga_bit33/fpga_bit50 names when available,
-	 * selecting based on the current voltage threshold. Fall back to the
-	 * legacy model-name lookup otherwise. */
 	if (devc->profile->fpga_bit33 && devc->profile->fpga_bit50) {
 		if (devc->vth < 1.40)
 			name = devc->profile->fpga_bit33;
 		else
 			name = devc->profile->fpga_bit50;
+	} else if (devc->profile->fpga_bit33) {
+		name = devc->profile->fpga_bit33;
+	} else if (devc->profile->fpga_bit50) {
+		name = devc->profile->fpga_bit50;
 	} else if (!strcmp(devc->profile->model, "DSLogic")) {
 		if (devc->vth < 1.40)
 			name = "DSLogic33.bin";
@@ -1182,73 +1274,18 @@ SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi)
 		name = "DSLogicBasic.bin";
 	} else if (!strcmp(devc->profile->model, "DSCope")) {
 		name = "DSCope.bin";
-	} else {
+	}
+	return name;
+}
+
+SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi)
+{
+	const char *name = get_fpga_bitstream_name(sdi);
+	if (!name) {
 		sr_err("Failed to select FPGA firmware.");
 		return SR_ERR;
 	}
-
-	sr_dbg("Uploading FPGA firmware '%s'.", name);
-
-	/* Check presence first: sr_resource_open() failure below would report the
-	 * generic "Firmware not found." without naming the file or the searched
-	 * directories. */
-	if (!dslogic_firmware_exists(drvc->sr_ctx, name)) {
-		dslogic_report_missing_firmware(drvc->sr_ctx, devc->profile, name);
-		return SR_ERR;
-	}
-
-	result = sr_resource_open(drvc->sr_ctx, &bitstream,
-			SR_RESOURCE_FIRMWARE, name);
-	if (result != SR_OK)
-		return result;
-
-	/* Tell the device firmware is coming. */
-	if ((ret = libusb_control_transfer(usb->devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-			LIBUSB_ENDPOINT_OUT, DS_CMD_CONFIG, 0x0000, 0x0000,
-			(unsigned char *)&cmd, sizeof(cmd), USB_TIMEOUT)) < 0) {
-		sr_err("Failed to upload FPGA firmware: %s.", libusb_error_name(ret));
-		sr_resource_close(drvc->sr_ctx, &bitstream);
-		return SR_ERR;
-	}
-
-	/* Give the FX2 time to get ready for FPGA firmware upload. */
-	g_usleep(FPGA_UPLOAD_DELAY);
-
-	buf = g_malloc(FW_BUFSIZE);
-	sum = 0;
-	result = SR_OK;
-	while (1) {
-		chunksize = sr_resource_read(drvc->sr_ctx, &bitstream,
-				buf, FW_BUFSIZE);
-		if (chunksize < 0)
-			result = SR_ERR;
-		if (chunksize <= 0)
-			break;
-
-		if ((ret = libusb_bulk_transfer(usb->devhdl, 2 | LIBUSB_ENDPOINT_OUT,
-				buf, chunksize, &transferred, USB_TIMEOUT)) < 0) {
-			sr_err("Unable to configure FPGA firmware: %s.",
-					libusb_error_name(ret));
-			result = SR_ERR;
-			break;
-		}
-		sum += transferred;
-		sr_spew("Uploaded %" PRIu64 "/%" PRIu64 " bytes.",
-			sum, bitstream.size);
-
-		if (transferred != chunksize) {
-			sr_err("Short transfer while uploading FPGA firmware.");
-			result = SR_ERR;
-			break;
-		}
-	}
-	g_free(buf);
-	sr_resource_close(drvc->sr_ctx, &bitstream);
-
-	if (result == SR_OK)
-		sr_dbg("FPGA firmware upload done.");
-
-	return result;
+	return dsl_fpga_config(sdi, name);
 }
 
 SR_PRIV int dslogic_set_voltage_threshold(const struct sr_dev_inst *sdi, double threshold)
@@ -1457,34 +1494,37 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	struct sr_dev_driver *di;
 	struct drv_context *drvc;
 	struct dev_context *devc;
-	struct sr_usb_dev_inst *usb;
-	struct dsl_trigger_pos *tpos;
-	struct libusb_transfer *transfer;
 	int ret;
 
 	di = sdi->driver;
 	drvc = di->context;
 	devc = sdi->priv;
-	usb = sdi->conn;
 
 	devc->ctx = drvc->sr_ctx;
 	devc->sent_samples = 0;
 	devc->empty_transfer_count = 0;
 	devc->acq_aborted = FALSE;
 	devc->trigger_pos = 0;
+	/* dsl_dev_acquisition_stop() keys its state machine on this flag and it
+	 * is only ever cleared here: without the reset the *second* capture of a
+	 * session would skip the bmFORCE_RDY handshake and jump straight to
+	 * DSL_CTL_STOP. Reference: dev_acquisition_start() in DSView
+	 * dslogic.c:1438 / PXView_v1.49 dslogic.c:1426. */
+	devc->abort = FALSE;
 
 	/* Loop mode: keep limit_samples non-zero so the app ring buffer
 	 * (get_ring_sample_count() -> limit_samples) sizes to the selected
 	 * duration window. The receive_transfer stop condition guards on
 	 * !is_loop, so loop keeps streaming forever. Aligns with PXView-1.5.8. */
 
-	usb_source_add(sdi->session, devc->ctx, timeout, receive_data, drvc);
-
 	if ((ret = command_stop_acquisition(sdi)) != SR_OK)
 		return ret;
 
+	devc->status = DSL_INIT;
+
 	if (devc->mode == DSL_MODE_LOGIC) {
-		if ((ret = fpga_configure(sdi)) != SR_OK)
+		devc->actual_samples = (devc->limit_samples + SAMPLES_ALIGN) & ~SAMPLES_ALIGN;
+		if ((ret = dsl_fpga_arm(sdi)) != SR_OK)
 			return ret;
 	} else {
 		/* DSO / ANALOG mode: send DSO sync, update trigger position,
@@ -1500,37 +1540,45 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 			return ret;
 	}
 
-	if ((ret = command_start_acquisition(sdi)) != SR_OK)
+	/* Submit the trigger packet *and* the data transfers before START.
+	 * The device starts pushing data the moment DSL_CTL_START is written,
+	 * so anything not queued by then is lost (stream mode) or shifts the
+	 * capture (buffer mode). Order taken from dev_acquisition_start() in
+	 * the 1.3.2 reference (dslogic.c:1468 start_transfers -> :1477 START).
+	 * The USB event source is registered after the transfers, like the
+	 * reference: from here on the callbacks must be pumped, and every
+	 * failure before this point leaves nothing behind to clean up. */
+	if ((ret = start_transfers(sdi)) != SR_OK)
 		return ret;
 
-	sr_dbg("Getting trigger.");
-	tpos = g_malloc(sizeof(struct dsl_trigger_pos));
-	transfer = libusb_alloc_transfer(0);
-	libusb_fill_bulk_transfer(transfer, usb->devhdl, 6 | LIBUSB_ENDPOINT_IN,
-			(unsigned char *)tpos, sizeof(struct dsl_trigger_pos),
-			trigger_receive, (void *)sdi, 0);
-	if ((ret = libusb_submit_transfer(transfer)) < 0) {
-		sr_err("Failed to request trigger: %s.", libusb_error_name(ret));
-		libusb_free_transfer(transfer);
-		g_free(tpos);
-		return SR_ERR;
-	}
+	usb_source_add(sdi->session, devc->ctx, timeout, receive_data, drvc);
 
-	devc->transfers = g_try_malloc0(sizeof(*devc->transfers));
-	if (!devc->transfers) {
-		sr_err("USB trigger_pos transfer malloc failed.");
-		return SR_ERR_MALLOC;
+	if ((ret = command_start_acquisition(sdi)) != SR_OK) {
+		/* Transfers are already queued; drain them so the session ends
+		 * through finish_acquisition() instead of hanging on a device
+		 * that was never started. */
+		abort_acquisition(devc);
+		return ret;
 	}
-	devc->num_transfers = 1;
-	devc->submitted_transfers++;
-	devc->transfers[0] = transfer;
+	devc->status = DSL_START;
 
-	return ret;
+	/* Header last, exactly like the reference (dslogic.c:1510): the
+	 * frontend must not see data before it knows the acquisition started. */
+	std_session_send_df_header(sdi);
+
+	return SR_OK;
 }
 
 SR_PRIV int dslogic_acquisition_stop(struct sr_dev_inst *sdi)
 {
-	command_stop_acquisition(sdi);
+	/* Ask the FPGA to finish first (bmFORCE_RDY), then cancel the host side
+	 * transfers. The old fork's stop path was dsl_dev_acquisition_stop()
+	 * (DSView dslogic.c:1523 / PXView_v1.49 dslogic.c:1496), but this
+	 * driver binds dslogic_acquisition_stop() to dev_acquisition_stop, so
+	 * that function had become dead code and the bmFORCE_RDY handshake was
+	 * never sent -- a stop then relied on the FPGA noticing the cancelled
+	 * transfers, which only works once the capture has already finished. */
+	dsl_dev_acquisition_stop(sdi, NULL);
 	abort_acquisition(sdi->priv);
 	return SR_OK;
 }
@@ -1579,6 +1627,40 @@ SR_PRIV int dsl_rd_reg(const struct sr_dev_inst *sdi, uint8_t addr, uint8_t *val
 		return SR_ERR;
 	}
 
+	return SR_OK;
+}
+
+/* Read the FPGA HDL version byte.
+ *
+ * The FPGA reports its bitstream generation through the I2C status window:
+ * the whole window (HDL_VERSION_ADDR+1 bytes) is read and the byte at
+ * HDL_VERSION_ADDR is the version. Used by dsl_dev_open() to reject a device
+ * that is already configured but runs an incompatible bitstream -- without
+ * this check such a device opens fine and then misbehaves in ways that look
+ * like a data-layer bug. Mirrors dsl_hdl_version() in the reference driver
+ * (DSView dsl.c:438 / PXView_v1.49 dsl.c:438). */
+SR_PRIV int dsl_hdl_version(const struct sr_dev_inst *sdi, uint8_t *value)
+{
+	struct sr_usb_dev_inst *usb;
+	struct ctl_rd_cmd rd_cmd;
+	uint8_t rdata[HDL_VERSION_ADDR + 1];
+	int ret;
+
+	if (!sdi || !sdi->conn || !value)
+		return SR_ERR_ARG;
+
+	usb = sdi->conn;
+
+	rd_cmd.header.dest = DSL_CTL_I2C_STATUS;
+	rd_cmd.header.offset = 0;
+	rd_cmd.header.size = HDL_VERSION_ADDR + 1;
+	rd_cmd.data = rdata;
+	if ((ret = command_ctl_rd(usb->devhdl, rd_cmd)) != SR_OK) {
+		sr_err("Sent DSL_CTL_I2C_STATUS command failed.");
+		return SR_ERR;
+	}
+
+	*value = rdata[HDL_VERSION_ADDR];
 	return SR_OK;
 }
 
@@ -2512,37 +2594,55 @@ SR_PRIV int dsl_fpga_arm(const struct sr_dev_inst *sdi)
 	}
 }
 
-SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filename)
+SR_PRIV int dsl_fpga_config(const struct sr_dev_inst *sdi, const char *name)
 {
-	FILE *fw;
-	int chunksize, ret;
+	struct drv_context *drvc;
+	struct dev_context *devc;
+	struct sr_usb_dev_inst *usb;
+	struct libusb_device_handle *hdl;
+	struct sr_resource bitstream;
+	int ret, chunksize, transferred;
 	unsigned char *buf;
-	int transferred;
 	uint64_t filesize;
 	struct ctl_wr_cmd wr_cmd;
 	struct ctl_rd_cmd rd_cmd;
 	uint8_t rd_cmd_data;
-	struct stat f_stat;
+	int wait_init_cnt, wait_gpif_cnt, wait_fpga_cnt;
 
-	sr_info("Configure FPGA using \"%s\"", filename);
-	if ((fw = fopen(filename, "rb")) == NULL) {
-		sr_err("Unable to open FPGA bit file %s for reading: %s",
-		       filename, strerror(errno));
+	if (!sdi || !name)
+		return SR_ERR_ARG;
+
+	drvc = sdi->driver->context;
+	devc = sdi->priv;
+	usb = sdi->conn;
+	hdl = usb->devhdl;
+
+	sr_info("Configure FPGA using \"%s\"", name);
+
+	if (!dslogic_firmware_exists(drvc->sr_ctx, name)) {
+		dslogic_report_missing_firmware(drvc->sr_ctx, devc->profile, name);
 		return SR_ERR;
 	}
 
-	if (stat(filename, &f_stat) == -1) {
-		fclose(fw);
-		return SR_ERR;
+	ret = sr_resource_open(drvc->sr_ctx, &bitstream, SR_RESOURCE_FIRMWARE, name);
+	if (ret != SR_OK)
+		return ret;
+
+	filesize = bitstream.size;
+	buf = g_malloc(filesize);
+	if (!buf) {
+		sr_err("FPGA configure buf malloc failed (%" PRIu64 " bytes).", filesize);
+		sr_resource_close(drvc->sr_ctx, &bitstream);
+		return SR_ERR_MALLOC;
 	}
 
-	filesize = (uint64_t)f_stat.st_size;
-
-	if ((buf = malloc(filesize)) == NULL) {
-		sr_err("FPGA configure buf malloc failed.");
-		fclose(fw);
+	if (sr_resource_read(drvc->sr_ctx, &bitstream, buf, filesize) != (ssize_t)filesize) {
+		sr_err("Failed to read FPGA bitstream %s.", name);
+		sr_resource_close(drvc->sr_ctx, &bitstream);
+		g_free(buf);
 		return SR_ERR;
 	}
+	sr_resource_close(drvc->sr_ctx, &bitstream);
 
 	/* step0: assert PROG_B low */
 	wr_cmd.header.dest = DSL_CTL_PROG_B;
@@ -2550,8 +2650,7 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	wr_cmd.header.size = 1;
 	wr_cmd.data[0] = (uint8_t)~bmWR_PROG_B;
 	if ((ret = command_ctl_wr(hdl, wr_cmd)) != SR_OK) {
-		fclose(fw);
-		free(buf);
+		g_free(buf);
 		return SR_ERR;
 	}
 
@@ -2561,8 +2660,7 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	wr_cmd.header.size = 1;
 	wr_cmd.data[0] = (uint8_t)(~bmLED_GREEN & ~bmLED_RED);
 	if ((ret = command_ctl_wr(hdl, wr_cmd)) != SR_OK) {
-		fclose(fw);
-		free(buf);
+		g_free(buf);
 		return SR_ERR;
 	}
 
@@ -2572,8 +2670,7 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	wr_cmd.header.size = 1;
 	wr_cmd.data[0] = bmWR_PROG_B;
 	if ((ret = command_ctl_wr(hdl, wr_cmd)) != SR_OK) {
-		fclose(fw);
-		free(buf);
+		g_free(buf);
 		return SR_ERR;
 	}
 
@@ -2583,14 +2680,20 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	rd_cmd.header.size = 1;
 	rd_cmd_data = 0;
 	rd_cmd.data = &rd_cmd_data;
-	while (1) {
+	wait_init_cnt = 1000;
+	while (wait_init_cnt-- > 0) {
 		if ((ret = command_ctl_rd(hdl, rd_cmd)) != SR_OK) {
-			fclose(fw);
-			free(buf);
+			g_free(buf);
 			return SR_ERR;
 		}
 		if (rd_cmd_data & bmFPGA_INIT_B)
 			break;
+		g_usleep(1000);
+	}
+	if (!(rd_cmd_data & bmFPGA_INIT_B)) {
+		sr_err("Wait INIT_B high timed out.");
+		g_free(buf);
+		return SR_ERR;
 	}
 
 	/* step4: send config ctl command */
@@ -2599,8 +2702,7 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	wr_cmd.header.size = 1;
 	wr_cmd.data[0] = (uint8_t)~bmWR_INTRDY;
 	if ((ret = command_ctl_wr(hdl, wr_cmd)) != SR_OK) {
-		fclose(fw);
-		free(buf);
+		g_free(buf);
 		return SR_ERR;
 	}
 
@@ -2612,24 +2714,16 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	wr_cmd.data[2] = (uint8_t)(filesize >> 16);
 	if ((ret = command_ctl_wr(hdl, wr_cmd)) != SR_OK) {
 		sr_err("Configure FPGA error: send command fpga_config failed.");
-		fclose(fw);
-		free(buf);
+		g_free(buf);
 		return SR_ERR;
 	}
 
 	/* step5: send config data */
-	chunksize = (int)fread(buf, 1, filesize, fw);
-	fclose(fw);
-
-	if (chunksize <= 0) {
-		free(buf);
-		return SR_ERR;
-	}
-
+	chunksize = (int)filesize;
 	ret = libusb_bulk_transfer(hdl, 2 | LIBUSB_ENDPOINT_OUT,
 	                           buf, chunksize,
-	                           &transferred, 1000);
-	free(buf);
+	                           &transferred, 3000);
+	g_free(buf);
 
 	if (ret < 0) {
 		sr_err("Unable to configure FPGA of dsl device: %s.",
@@ -2655,9 +2749,15 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	rd_cmd.header.size = 1;
 	rd_cmd_data = 0;
 	rd_cmd.data = &rd_cmd_data;
-	while ((ret = command_ctl_rd(hdl, rd_cmd)) == SR_OK) {
-		if (rd_cmd_data & bmGPIF_DONE)
+	wait_gpif_cnt = 1000;
+	while (wait_gpif_cnt-- > 0) {
+		if ((ret = command_ctl_rd(hdl, rd_cmd)) == SR_OK && (rd_cmd_data & bmGPIF_DONE))
 			break;
+		g_usleep(1000);
+	}
+	if (!(rd_cmd_data & bmGPIF_DONE)) {
+		sr_err("Wait GPIF_DONE timed out.");
+		return SR_ERR;
 	}
 
 	/* step8: assert INTRDY low */
@@ -2674,16 +2774,22 @@ SR_PRIV int dsl_fpga_config(struct libusb_device_handle *hdl, const char *filena
 	rd_cmd.header.size = 1;
 	rd_cmd_data = 0;
 	rd_cmd.data = &rd_cmd_data;
-	while ((ret = command_ctl_rd(hdl, rd_cmd)) == SR_OK) {
-		if (rd_cmd_data & bmFPGA_DONE) {
+	wait_fpga_cnt = 1000;
+	while (wait_fpga_cnt-- > 0) {
+		if ((ret = command_ctl_rd(hdl, rd_cmd)) == SR_OK && (rd_cmd_data & bmFPGA_DONE)) {
 			/* step10: turn on GREEN led */
 			wr_cmd.header.dest = DSL_CTL_LED;
 			wr_cmd.header.offset = 0;
 			wr_cmd.header.size = 1;
 			wr_cmd.data[0] = bmLED_GREEN;
-			if ((ret = command_ctl_wr(hdl, wr_cmd)) == SR_OK)
-				break;
+			command_ctl_wr(hdl, wr_cmd);
+			break;
 		}
+		g_usleep(1000);
+	}
+	if (!(rd_cmd_data & bmFPGA_DONE)) {
+		sr_err("Wait FPGA_DONE timed out.");
+		return SR_ERR;
 	}
 
 	/* recover GPIF to be wordwide */
@@ -2979,6 +3085,31 @@ SR_PRIV int dsl_config_list(uint32_t key, GVariant **data, const struct sr_dev_i
  * dsl_dev_open / dsl_dev_close / dsl_dev_acquisition_stop / status
  * =========================================================================== */
 
+/* Release and close the USB handle opened by dsl_dev_open().
+ *
+ * Every failure path after libusb_claim_interface() used to return with the
+ * interface still claimed and the handle open. The handle then outlives the
+ * failed open: api.c's renumerate retry loop calls dsl_dev_open() again, and
+ * the second libusb_claim_interface() on a *new* handle fails with
+ * LIBUSB_ERROR_BUSY because our own previous handle still owns the
+ * interface -- so a single failed open poisons every later attempt until the
+ * process exits. Same class of bug as px_usb_close_handle() on the pxlogic
+ * side. Idempotent: no handle means nothing to do. */
+static void dsl_release_handle(struct sr_dev_inst *sdi)
+{
+	struct sr_usb_dev_inst *usb;
+
+	if (!sdi)
+		return;
+	usb = sdi->conn;
+	if (!usb || !usb->devhdl)
+		return;
+
+	libusb_release_interface(usb->devhdl, USB_INTERFACE);
+	libusb_close(usb->devhdl);
+	usb->devhdl = NULL;
+}
+
 SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboolean *fpga_done)
 {
 	struct sr_usb_dev_inst *usb;
@@ -3007,6 +3138,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
 	ret = libusb_claim_interface(usb->devhdl, USB_INTERFACE);
 	if (ret != LIBUSB_SUCCESS) {
 		sr_err("Unable to claim interface: %s.", libusb_error_name(ret));
+		dsl_release_handle(sdi);
 		return SR_ERR;
 	}
 
@@ -3018,18 +3150,45 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
 	rd_cmd.data = &hw_info;
 	if ((ret = command_ctl_rd(usb->devhdl, rd_cmd)) != SR_OK) {
 		sr_err("Failed to get hardware information.");
+		dsl_release_handle(sdi);
 		return SR_ERR;
 	}
 	if (fpga_done)
 		*fpga_done = (hw_info & bmFPGA_DONE) != 0;
+
+	/* A configured FPGA may still be running an older bitstream. Verify its
+	 * HDL generation and force a re-flash when it does not match. The
+	 * reference drivers reject such a device outright (DSView
+	 * dsl.c:1928-1943, PXView_v1.49 dsl.c:1928-1943); refusing here would
+	 * leave the device permanently unusable (bmFPGA_DONE stays set, so
+	 * every later open is refused too), and the bitstream ships with the
+	 * app -- so re-flash instead of rejecting. */
+	if (fpga_done && *fpga_done) {
+		uint8_t hdl_version = 0;
+
+		dsl_wr_reg(sdi, CTR0_ADDR, bmNONE);	/* dessert clear */
+		if (dsl_hdl_version(sdi, &hdl_version) != SR_OK) {
+			sr_err("Failed to get FPGA bin version; re-flashing bitstream.");
+			*fpga_done = FALSE;
+		} else if (hdl_version != DSL_HDL_VERSION) {
+			sr_err("HDL version incompatible (device:%02X, target:%02X);"
+			       " re-flashing bitstream.",
+			       hdl_version, DSL_HDL_VERSION);
+			*fpga_done = FALSE;
+		} else {
+			sr_info("FPGA already configured (bmFPGA_DONE set); skipping upload.");
+		}
+	}
 
 	/* Upload FPGA bitstream if not configured. */
 	if (fpga_done && !(*fpga_done)) {
 		ret = dslogic_fpga_firmware_upload(sdi);
 		if (ret != SR_OK) {
 			sr_err("Configure FPGA failed.");
+			dsl_release_handle(sdi);
 			return SR_ERR;
 		}
+		*fpga_done = TRUE;
 	}
 
 	/* Security check for CAPS_FEATURE_SECURITY devices. */
@@ -3038,6 +3197,7 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
 		dsl_wr_reg(sdi, CTR0_ADDR, bmNONE);
 		if (dsl_rd_nvm(sdi, (unsigned char *)encryption, SECU_EEP_ADDR, SECU_STEPS * 2) != SR_OK) {
 			sr_err("Read EEPROM content failed.");
+			dsl_release_handle(sdi);
 			return SR_ERR;
 		}
 		ret = dsl_secuCheck(sdi, encryption, SECU_STEPS);
@@ -3150,9 +3310,11 @@ SR_PRIV unsigned int dsl_get_timeout(const struct sr_dev_inst *sdi)
 
 SR_PRIV int dsl_start_transfers(const struct sr_dev_inst *sdi)
 {
-	/* Delegates to start_transfers() which submits data transfers with
-	 * receive_transfer() as the callback. receive_transfer() dispatches
-	 * by devc->mode (LOGIC/DSO/ANALOG), so this works for all modes. */
+	/* Reference-name alias for start_transfers(), which now submits the
+	 * trigger packet (slot 0) plus the data transfers, exactly like
+	 * dsl_start_transfers() in the 1.3.2 reference. Kept because the
+	 * acquisition path is easier to follow when the two names line up with
+	 * the reference. */
 	return start_transfers(sdi);
 }
 
