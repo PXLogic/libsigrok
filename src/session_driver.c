@@ -210,32 +210,76 @@ static gboolean stream_pxv_logic_data(struct sr_dev_inst *sdi)
 	 */
 	samples_in_block = block_size * 8;
 	const int num_groups = block_size / 8; // 每组 64 samples (8 字节)
+	/* 尾部余数：不足一个 64 样本组的样本数（每通道 1..7 字节 = 8..56 个样本）。
+	 * 范围存档（set_export_config）按 8 样本字节对齐落盘，块大小并不总是 64
+	 * 的整数倍；若这里用整除把余数丢掉，最后最多 56 个样本会静默消失
+	 * （实测：保存 3000 个样本的范围，重新加载后只剩 2944 —— 375 字节
+	 * = 46 整组 + 7 字节 = 46*64 + 56）。 */
+	const int tail_samples = samples_in_block - num_groups * 64;
 	out_size = num_groups * ch_count * 8;
-	out_buf = g_malloc0(out_size);
 
-	uint64_t *dst_u64 = (uint64_t *)out_buf;
-	for (int g = 0; g < num_groups; g++) {
-		for (ch_ordinal = 0; ch_ordinal < ch_count; ch_ordinal++) {
-			if (channel_bufs[ch_ordinal]) {
-				const uint64_t *src_u64 = (const uint64_t *)(channel_bufs[ch_ordinal] + g * 8);
-				*dst_u64++ = *src_u64;
-			} else {
-				*dst_u64++ = 0;
+	if (out_size > 0) {
+		out_buf = g_malloc0(out_size);
+
+		uint64_t *dst_u64 = (uint64_t *)out_buf;
+		for (int g = 0; g < num_groups; g++) {
+			for (ch_ordinal = 0; ch_ordinal < ch_count; ch_ordinal++) {
+				if (channel_bufs[ch_ordinal]) {
+					const uint64_t *src_u64 = (const uint64_t *)(channel_bufs[ch_ordinal] + g * 8);
+					*dst_u64++ = *src_u64;
+				} else {
+					*dst_u64++ = 0;
+				}
 			}
 		}
+
+		got_data = TRUE;
+		packet.type = SR_DF_LOGIC;
+		packet.payload = &logic;
+		logic.length = out_size;
+		logic.unitsize = 1;
+		logic.format = LA_CROSS_DATA;
+		logic.data = out_buf;
+		vdev->bytes_read += out_size;
+		sr_session_send(sdi, &packet);
+
+		g_free(out_buf);
 	}
 
-	got_data = TRUE;
-	packet.type = SR_DF_LOGIC;
-	packet.payload = &logic;
-	logic.length = out_size;
-	logic.unitsize = 1;
-	logic.format = LA_CROSS_DATA;
-	logic.data = out_buf;
-	vdev->bytes_read += out_size;
-	sr_session_send(sdi, &packet);
+	if (tail_samples > 0) {
+		/* 余数按样本交织格式补一个短包。append_payload_impl 从
+		 * _ring_sample_count 继续追加，两种格式可以在同一快照上衔接：
+		 * 交叉包总是以整组 64 样本结束（_byte_fraction 归零），而余数恒为
+		 * 整字节，不会留下半个字节的残留。
+		 * 位序用**序号**（ch_ordinal），与 append_payload_impl 的
+		 * ch_ctx[ch] = {ch/8, 1<<(ch%8)} 一致；若用 sr_channel->index，
+		 * 在只启用部分通道时会写到缓冲区之外。 */
+		const int tail_size = tail_samples * unitsize;
+		uint8_t *tail_buf = g_malloc0(tail_size);
+		for (int s = 0; s < tail_samples; s++) {
+			const int src_byte = num_groups * 8 + s / 8;
+			const int src_bit = s % 8;
+			for (ch_ordinal = 0; ch_ordinal < ch_count; ch_ordinal++) {
+				if (!channel_bufs[ch_ordinal])
+					continue;
+				if ((channel_bufs[ch_ordinal][src_byte] >> src_bit) & 1)
+					tail_buf[s * unitsize + ch_ordinal / 8] |=
+						(uint8_t)(1 << (ch_ordinal % 8));
+			}
+		}
 
-	g_free(out_buf);
+		got_data = TRUE;
+		packet.type = SR_DF_LOGIC;
+		packet.payload = &logic;
+		logic.length = tail_size;
+		logic.unitsize = unitsize;
+		logic.format = LA_SPLIT_DATA;
+		logic.data = tail_buf;
+		vdev->bytes_read += tail_size;
+		sr_session_send(sdi, &packet);
+
+		g_free(tail_buf);
+	}
 	for (ch_ordinal = 0; ch_ordinal < ch_count; ch_ordinal++)
 		g_free(channel_bufs[ch_ordinal]);
 	g_free(channel_bufs);
