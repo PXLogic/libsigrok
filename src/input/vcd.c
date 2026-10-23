@@ -690,7 +690,7 @@ static int parse_header_var(struct context *inc, char *contents)
 {
 	char *type, *size_txt, *id, *ref, *idx;
 	gboolean is_reg, is_wire, is_logic, is_real, is_int;
-	gboolean is_str;
+	gboolean is_str, is_param, is_event, is_net_logic;
 	enum sr_channeltype ch_type;
 	size_t size, next_size;
 	struct vcd_channel *vcd_ch;
@@ -714,15 +714,27 @@ static int parse_header_var(struct context *inc, char *contents)
 	is_reg = g_strcmp0(type, "reg") == 0;
 	is_wire = g_strcmp0(type, "wire") == 0;
 	is_logic = g_strcmp0(type, "logic") == 0;
-	is_real = g_strcmp0(type, "real") == 0;
+	is_net_logic = g_strcmp0(type, "tri") == 0 ||
+		g_strcmp0(type, "triand") == 0 ||
+		g_strcmp0(type, "trior") == 0 ||
+		g_strcmp0(type, "trireg") == 0 ||
+		g_strcmp0(type, "tri0") == 0 ||
+		g_strcmp0(type, "tri1") == 0 ||
+		g_strcmp0(type, "wand") == 0 ||
+		g_strcmp0(type, "wor") == 0 ||
+		g_strcmp0(type, "supply0") == 0 ||
+		g_strcmp0(type, "supply1") == 0;
+	is_real = g_strcmp0(type, "real") == 0 || g_strcmp0(type, "realtime") == 0;
 	is_int = g_strcmp0(type, "integer") == 0;
 	is_str = g_strcmp0(type, "string") == 0;
+	is_param = g_strcmp0(type, "parameter") == 0;
+	is_event = g_strcmp0(type, "event") == 0 || g_strcmp0(type, "time") == 0;
 
-	if (is_reg || is_wire || is_logic) {
+	if (is_reg || is_wire || is_logic || is_net_logic) {
 		ch_type = SR_CHANNEL_LOGIC;
 	} else if (is_real || is_int) {
 		ch_type = SR_CHANNEL_ANALOG;
-	} else if (is_str) {
+	} else if (is_str || is_param || is_event) {
 		sr_warn("Skipping id %s, name '%s%s', unsupported type '%s'.",
 			id, ref, idx ? idx : "", type);
 		inc->ignored_signals = g_slist_append(inc->ignored_signals,
