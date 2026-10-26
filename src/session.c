@@ -1064,7 +1064,9 @@ static void datafeed_dump(const struct sr_datafeed_packet *packet)
 	case SR_DF_LOGIC:
 		logic = packet->payload;
 		sr_dbg("bus: Received SR_DF_LOGIC packet (%" PRIu64 " bytes, "
-		       "unitsize = %d).", logic->length, logic->unitsize);
+		       "unitsize = %d, format = %d, block_bytes = %d).",
+		       logic->length, logic->unitsize, logic->format,
+		       logic->block_bytes);
 		break;
 	case SR_DF_FRAME_BEGIN:
 		sr_dbg("bus: Received SR_DF_FRAME_BEGIN packet.");
@@ -1170,8 +1172,24 @@ SR_PRIV int sr_session_send(const struct sr_dev_inst *sdi,
 	if (packet->type == SR_DF_LOGIC && packet->payload) {
 		struct sr_datafeed_logic *logic =
 			(struct sr_datafeed_logic *)packet->payload;
-		if (logic->format != LA_CROSS_DATA)
+		if (logic->format != LA_CROSS_DATA) {
 			logic->format = LA_SPLIT_DATA;
+			/* block_bytes only describes the CROSS layout. */
+			logic->block_bytes = 0;
+		} else if (logic->block_bytes < SR_LOGIC_DEFAULT_BLOCK_BYTES ||
+			   logic->block_bytes > SR_LOGIC_MAX_BLOCK_BYTES ||
+			   (logic->block_bytes & 7)) {
+			/* Missing (0) or out of range → historical 8-byte block.
+			 *
+			 * This cannot be a plain `== 0` check: drivers declare
+			 * `struct sr_datafeed_logic logic;` on the stack and only
+			 * assign the fields they care about, so an unset
+			 * block_bytes is *garbage*, not 0. `format` gets away with
+			 * "only CROSS is accepted"; a width has no such single
+			 * sentinel value, so validate against the legal set
+			 * (multiple of 8, 8..8192) and fall back otherwise. */
+			logic->block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;
+		}
 	}
 
 	/*

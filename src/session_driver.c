@@ -108,7 +108,7 @@ static gboolean stream_pxv_logic_data(struct sr_dev_inst *sdi)
 {
 	struct session_vdev *vdev;
 	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	struct sr_datafeed_logic logic = {0};
 	struct zip_stat zs;
 	char chunkname[32];
 	struct zip_file *zf;
@@ -239,6 +239,9 @@ static gboolean stream_pxv_logic_data(struct sr_dev_inst *sdi)
 		logic.length = out_size;
 		logic.unitsize = 1;
 		logic.format = LA_CROSS_DATA;
+		/* 存档回放自己按 8 字节/通道 拼组（L-<ch>/<block> 是逐通道位图），
+		 * 与源设备的 FPGA 位宽无关。 */
+		logic.block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;
 		logic.data = out_buf;
 		vdev->bytes_read += out_size;
 		sr_session_send(sdi, &packet);
@@ -541,7 +544,7 @@ static gboolean stream_session_data(struct sr_dev_inst *sdi)
 {
 	struct session_vdev *vdev;
 	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	struct sr_datafeed_logic logic = {0};
 	struct sr_datafeed_analog analog;
 	struct sr_analog_encoding encoding;
 	struct sr_analog_meaning meaning;

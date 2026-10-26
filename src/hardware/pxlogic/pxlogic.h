@@ -252,6 +252,9 @@ struct PX_context {
   gboolean rle_support;
   uint8_t test_mode;
   uint32_t block_size;
+  /* CROSS 交织块宽度（字节/通道/拍）。见 sr_datafeed_logic.block_bytes。
+   * 缺省 8 = 250 MHz / 64-bit 机型；16 = 125 MHz / 128-bit 机型。 */
+  uint16_t cross_block_bytes;
   gboolean acq_aborted;
   double vth;
   gboolean clock_edge;

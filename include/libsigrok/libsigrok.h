@@ -554,8 +554,11 @@ struct sr_datafeed_meta {
  *   This is the default for upstream sigrok drivers (fx2lafw, demo, ...).
  *
  * LA_CROSS_DATA: channel-block (PXLogic/DSLogic fork format, "cross data").
- *   Hardware DMA writes 64 samples for channel 0, then 64 samples for
- *   channel 1, ..., then 64 samples for channel N-1, then repeats.
+ *   Hardware DMA writes `block_bytes` bytes for channel 0, then the same
+ *   for channel 1, ..., then channel N-1, then repeats. One block is one
+ *   FPGA beat: 8 bytes = 64 samples at 250 MHz / 64-bit, 16 bytes = 128
+ *   samples at 125 MHz / 128-bit. The block width travels in
+ *   sr_datafeed_logic.block_bytes (0 = 8, the historical value).
  *   No deinterleave is performed in the driver — the raw USB buffer is
  *   forwarded as-is. Conversion to per-channel chunk tree is done by
  *   LogicSnapshot::append_cross_payload on the receive side.
@@ -570,12 +573,36 @@ enum LA_DATA_FORMAT {
 struct sr_datafeed_logic {
 	uint64_t length;
 	uint16_t unitsize;
+	/** LA_CROSS_DATA only: bytes per channel per interleave block.
+	 *
+	 *  The block is one hardware beat: a 250 MHz / 64-bit FPGA forwards
+	 *  64 samples (8 bytes) per channel per beat, a 125 MHz / 128-bit one
+	 *  forwards 128 samples (16 bytes). Same throughput, wider block.
+	 *
+	 *  0 means "unspecified" and is read as SR_LOGIC_DEFAULT_BLOCK_BYTES
+	 *  (8). Valid values are multiples of 8 in [8, 8192]: the receiver
+	 *  writes the block as `block_bytes / 8` whole u64 slots per channel,
+	 *  so a block narrower than one u64 (64 samples) is not representable.
+	 *
+	 *  `length` stays the total byte count; samples per channel remain
+	 *  `length * 8 / channel_num`, independent of this field.
+	 *  Ignored for LA_SPLIT_DATA (unitsize already describes the layout).
+	 *
+	 *  Placed after `unitsize` so it occupies the existing alignment
+	 *  padding: offsets of `format`/`data` and sizeof() are unchanged. */
+	uint16_t block_bytes;
 	/** Data format. LA_SPLIT_DATA (default) for upstream sigrok drivers,
 	 *  LA_CROSS_DATA for PXLogic/DSLogic fork drivers that forward raw
 	 *  channel-block USB data without deinterleaving. */
 	int format;
 	void *data;
 };
+
+/** Default value of sr_datafeed_logic.block_bytes (250 MHz / 64-bit beat). */
+#define SR_LOGIC_DEFAULT_BLOCK_BYTES 8
+/** Largest accepted sr_datafeed_logic.block_bytes
+ *  (= 65536 samples per channel per beat, 1024 u64 slots). */
+#define SR_LOGIC_MAX_BLOCK_BYTES 8192
 
 /** Analog datafeed payload for type SR_DF_ANALOG. */
 struct sr_datafeed_analog {

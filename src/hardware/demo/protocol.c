@@ -2126,7 +2126,7 @@ SR_PRIV int demo_prepare_data(int fd, int revents, void *cb_data)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	struct sr_datafeed_logic logic = {0};
 	struct analog_gen *ag;
 	GHashTableIter iter;
 	void *value;
@@ -2382,6 +2382,7 @@ SR_PRIV int demo_prepare_data(int fd, int revents, void *cb_data)
 					logic.length = cross_len;
 					logic.data = devc->cross_data_buf;
 					logic.format = LA_CROSS_DATA;
+					logic.block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;  /* demo: 8B/通道/组 */
 					sr_session_send(sdi, &packet);
 				}
 				/* 修复: logic_done 推进实际发送的 cross_samples (64 对齐截断),
@@ -2491,6 +2492,7 @@ SR_PRIV int demo_prepare_data(int fd, int revents, void *cb_data)
 						logic.length = cross_len;
 						logic.data = devc->cross_data_buf;
 						logic.format = LA_CROSS_DATA;
+						logic.block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;  /* demo: 8B/通道/组 */
 						sr_session_send(sdi, &packet);
 					}
 					/* 修复: 与 fast path 一致, 推进实际发送的 cross_samples 而非
@@ -3249,7 +3251,7 @@ SR_PRIV int demo_receive_data_logic_decoder(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	struct sr_datafeed_packet packet;
-	struct sr_datafeed_logic logic;
+	struct sr_datafeed_logic logic = {0};
 	struct sr_channel *ch_list[MAX_PROBE_NUM];
 	struct demo_packet_buffer *pb;
 	int chan_num;
@@ -3315,6 +3317,7 @@ SR_PRIV int demo_receive_data_logic_decoder(struct sr_dev_inst *sdi)
 		packet.payload = &logic;
 		logic.unitsize = 0;  /* unused for LA_CROSS_DATA */
 		logic.format = LA_CROSS_DATA;
+		logic.block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;  /* demo: 8B/通道/组 */
 		logic.length = pb->post_len;
 		logic.data = pb->post_buf;
 		sr_session_send(sdi, &packet);

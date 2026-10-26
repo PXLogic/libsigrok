@@ -322,6 +322,13 @@ static struct PX_context *pxlogic_dev_new(const struct PX_profile *prof)
     devc->trig_out_en = 0;
     devc->filter = 0;
     devc->mode = PXLOGIC_MODE_LOGIC;
+    /* CROSS 交织块宽度：每通道每拍多少字节。
+     * 本驱动（pxlogic）服务的全部机型都是 250 MHz / 64-bit FPGA，
+     * 一拍 64 样本 = 8 字节，所以这里固定取缺省值。
+     * 125 MHz / 128-bit（一拍 128 样本 = 16 字节）的新机型走独立驱动，
+     * 在它自己的接收路径里给 sr_datafeed_logic.block_bytes 赋 16 即可，
+     * 接收端无需任何改动。用法见 doc/宽块数据包使用说明.md。 */
+    devc->cross_block_bytes = SR_LOGIC_DEFAULT_BLOCK_BYTES;
 
     devc->pwm0_en = 0;
     devc->pwm0_freq = 1000;
@@ -967,6 +974,11 @@ static int hw_usb_open(struct sr_dev_driver *drv, struct sr_dev_inst *sdi, gbool
                     devc->model_unknown = FALSE;   /* 型号已确定 */
                     sr_info("Corrected profile: logic_mode %u -> %u (%s)",
                         old_mode, lm_data, devc->profile->model);
+
+                    /* 注意：块宽不在这里按型号分派。pxlogic 只服务
+                     * 250MHz×64bit 机型（8 字节/拍/通道）；128bit 的新机型
+                     * 有自己的驱动，块宽由那边赋值。见
+                     * doc/宽块数据包使用说明.md。 */
 
                     /* 型号名（sdi->model 是扫描时写入的，必须同步） */
                     sr_dev_inst_model_set(mut_sdi, devc->profile->model);
@@ -2262,7 +2274,7 @@ static void receive_transfer(struct libusb_transfer *transfer)
     struct PX_context *devc = transfer->user_data;
     struct sr_dev_inst *sdi = devc->cb_data;
     struct sr_datafeed_packet packet;
-    struct sr_datafeed_logic logic;
+    struct sr_datafeed_logic logic = {0};
     uint64_t samples_to_send = 0, sending_now;
     (void)samples_to_send;
     uint64_t offset = 0;
@@ -2325,8 +2337,6 @@ static void receive_transfer(struct libusb_transfer *transfer)
             {
                 if (devc->mode == PXLOGIC_MODE_LOGIC) {
                     uint64_t data_len = sending_now - offset;
-                    int ch_num = devc->ch_num;
-                    int unitsize = ch_num / 8;
 
                     packet.type = SR_DF_LOGIC;
                     packet.payload = &logic;
@@ -2337,7 +2347,14 @@ static void receive_transfer(struct libusb_transfer *transfer)
                      * the PXView side. This avoids the ~100ms/4MB deinterleave
                      * bottleneck on the USB receive path (v1.49 architecture). */
                     logic.length = data_len;
-                    logic.unitsize = unitsize;
+                    /* 只填 length / block_bytes / format / data 四个字段：
+                     *   unitsize 故意不设（保持 {0} 的 0）—— CROSS 下无意义，
+                     *     length 就是总字节数，接收端只读 length + block_bytes。
+                     *     2026-10-26 之前这里写的是 ch_num/8，那是驱动自己解交织
+                     *     发 LA_SPLIT_DATA 时代的遗留，改成直通后已是死值。
+                     *   block_bytes = 每通道每拍多少字节，接收端按它解析重排：
+                     *     缺省 8（250M×64bit），新机型 16（125M×128bit）。 */
+                    logic.block_bytes = devc->cross_block_bytes;
                     logic.format = LA_CROSS_DATA;
                     logic.data = transfer->buffer + offset;
 
