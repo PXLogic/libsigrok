@@ -146,12 +146,30 @@ static void LIBUSB_CALL ch32_receive_transfer(struct libusb_transfer *xfer)
 
 	devc = sdi->priv;
 
+	/* 停机后不再碰数据，只把 pending 减回去，让 ch32_usb_stream_stop()
+	 * 知道这个 transfer 的回调已经走完、可以安全释放。 */
+	g_mutex_lock(&devc->mutex);
+	if (!devc->stream.running) {
+		g_mutex_unlock(&devc->mutex);
+		g_atomic_int_dec_and_test(&devc->stream.pending);
+		return;
+	}
+	g_mutex_unlock(&devc->mutex);
+
 	if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0)
 		ch32h417_handle_stream_data(sdi, xfer->buffer, xfer->actual_length);
 
+	/* resubmit 必须和 stop 的“清 running + cancel”在同一把锁下串行化，
+	 * 否则会出现 stop 已经 cancel 完、回调又把 transfer 提交回去的漏网
+	 * 之鱼——那只 transfer 之后再没人 cancel，回调会在 devc 释放后才到。 */
+	g_mutex_lock(&devc->mutex);
 	if (devc->stream.running && !devc->acq_aborted) {
 		if (libusb_submit_transfer(xfer) != 0)
 			sr_err("resubmit transfer failed");
+		g_mutex_unlock(&devc->mutex);
+	} else {
+		g_mutex_unlock(&devc->mutex);
+		g_atomic_int_dec_and_test(&devc->stream.pending);
 	}
 }
 
@@ -164,6 +182,7 @@ SR_PRIV int ch32_usb_stream_start(struct sr_dev_inst *sdi, uint8_t ep)
 	devc->stream.ep = ep;
 	devc->stream.num = CH32_NUM_TRANSFERS;
 	devc->stream.running = TRUE;
+	g_atomic_int_set(&devc->stream.pending, 0);
 	devc->stream.xfer = g_try_malloc0(sizeof(*devc->stream.xfer) *
 			devc->stream.num);
 	if (!devc->stream.xfer) {
@@ -176,19 +195,32 @@ SR_PRIV int ch32_usb_stream_start(struct sr_dev_inst *sdi, uint8_t ep)
 		struct libusb_transfer *xfer;
 
 		buf = g_try_malloc(CH32_TRANSFER_SIZE);
-		if (!buf)
+		if (!buf) {
+			ch32_usb_stream_stop(sdi);
 			return SR_ERR_MALLOC;
+		}
 		xfer = libusb_alloc_transfer(0);
+		if (!xfer) {
+			g_free(buf);
+			ch32_usb_stream_stop(sdi);
+			return SR_ERR_MALLOC;
+		}
 		libusb_fill_bulk_transfer(xfer, usb->devhdl, ep, buf,
 				CH32_TRANSFER_SIZE, ch32_receive_transfer,
 				sdi, CH32_STREAM_TIMEOUT_MS);
+		/* 先把 xfer 挂进数组、pending 加一，再 submit：submit 成功后
+		 * 回调可能立刻在事件线程触发，停机时它会把 pending 减回去。 */
+		devc->stream.xfer[i] = xfer;
+		g_atomic_int_inc(&devc->stream.pending);
 		if (libusb_submit_transfer(xfer) != 0) {
 			sr_err("submit transfer failed (ep=0x%02x)", ep);
+			g_atomic_int_dec_and_test(&devc->stream.pending);
+			devc->stream.xfer[i] = NULL;
 			libusb_free_transfer(xfer);
 			g_free(buf);
+			ch32_usb_stream_stop(sdi);
 			return SR_ERR;
 		}
-		devc->stream.xfer[i] = xfer;
 	}
 	return SR_OK;
 }
@@ -197,25 +229,59 @@ SR_PRIV int ch32_usb_stream_stop(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	unsigned int i;
+	gint64 deadline;
+	gint left;
 
-	if (!devc->stream.running)
+	if (!devc->stream.xfer || devc->stream.num == 0)
 		return SR_OK;
 
+	/* 先断掉“回调再提交”的路（在锁内），再到锁外逐个 cancel。
+	 * cancel 放在锁外是为了避免后端同步回调造成的自锁。 */
+	g_mutex_lock(&devc->mutex);
 	devc->stream.running = FALSE;
+	devc->acq_aborted = TRUE;
+	g_mutex_unlock(&devc->mutex);
+
+	for (i = 0; i < devc->stream.num; i++) {
+		if (devc->stream.xfer[i])
+			libusb_cancel_transfer(devc->stream.xfer[i]);
+	}
+
+	/* libusb 明确规定：cancel 之后、回调返回之前释放 transfer 属于
+	 * undefined behaviour。取消完成回调由事件线程（sr_hotplug / 会话
+	 * USB 事件源）派发，这里等 pending 归零再释放。设备失联时最多等
+	 * 1s；超时宁可泄漏也不能 free，否则回调会踩已释放内存（实测会触发
+	 * darwin_async_io_callback 空指针 / libusb actual_length 断言 abort）。 */
+	deadline = g_get_monotonic_time() + 1000 * G_TIME_SPAN_MILLISECOND;
+	while ((left = g_atomic_int_get(&devc->stream.pending)) > 0 &&
+	       g_get_monotonic_time() < deadline) {
+		struct timeval tv = { 0, 5 * 1000 };
+		int done = 0;
+
+		/* 有独立事件线程时这里是空转；没有时由本函数把回调泵出来。 */
+		if (devc->sr_ctx && devc->sr_ctx->libusb_ctx)
+			libusb_handle_events_timeout_completed(
+					devc->sr_ctx->libusb_ctx, &tv, &done);
+		else
+			g_usleep(1000);
+	}
+
+	if ((left = g_atomic_int_get(&devc->stream.pending)) > 0) {
+		sr_warn("stream stop: %d transfer(s) not reaped, leaking to avoid UAF",
+				left);
+		g_free(devc->stream.xfer);
+		devc->stream.xfer = NULL;
+		devc->stream.num = 0;
+		return SR_ERR;
+	}
 
 	for (i = 0; i < devc->stream.num; i++) {
 		struct libusb_transfer *xfer = devc->stream.xfer[i];
-		if (!xfer)
-			continue;
-		libusb_cancel_transfer(xfer);
-	}
-	/* 取消是异步的，这里先释放本端资源；transfer 缓冲在回调结束前
-	 * 由 libusb 持有，交由事件循环收尾。 */
-	for (i = 0; i < devc->stream.num; i++) {
-		struct libusb_transfer *xfer = devc->stream.xfer[i];
+
 		if (!xfer)
 			continue;
 		g_free(xfer->buffer);
+		xfer->buffer = NULL;
 		libusb_free_transfer(xfer);
 		devc->stream.xfer[i] = NULL;
 	}
