@@ -44,6 +44,7 @@ struct ch32_usb_stream {
 	unsigned int num;                    /* 已提交的 transfer 数 */
 	struct libusb_transfer **xfer;       /* transfer 数组 */
 	gboolean running;
+	gint pending;                        /* 尚未回调的 transfer 数（原子） */
 };
 
 /* 打开/关闭设备（libusb open + claim + RAW_IO 处理） */
