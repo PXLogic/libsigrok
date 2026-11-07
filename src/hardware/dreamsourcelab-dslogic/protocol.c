@@ -26,12 +26,14 @@
 #include <glib/gstdio.h>
 #include "protocol.h"
 
-/* --- Local USB wire-protocol command constants (internal to protocol.c) ---
- * These are the raw bRequest values sent via libusb_control_transfer.
- * They do not conflict with command.h (which defines CMD_CTL_WR/RD_PRE/RD
- * and the DSL_CTL_* enum used by the newer command_ctl_wr/rd wrappers). */
-#define DS_CMD_GET_FW_VERSION		0xb0
-#define DS_CMD_GET_REVID_VERSION	0xb1
+/* --- Legacy upstream wire-protocol request codes (internal to protocol.c) ---
+ * The DSView (fork) firmware answers the CMD_CTL_WR / CMD_CTL_RD_PRE /
+ * CMD_CTL_RD requests with the DSL_CTL_* destinations defined in command.h —
+ * that is the protocol every live command path here uses. The DS_CMD_*
+ * values below are upstream libsigrok's request codes (0xb0..0xbc); they
+ * overlap the fork's 0xb0/0xb1/0xb2, so they must never be sent to fork
+ * firmware. Only the remaining legacy upstream code (fpga_configure() and
+ * dslogic_set_voltage_threshold()) still references them. */
 #define DS_CMD_START			0xb2
 #define DS_CMD_CONFIG			0xb3
 #define DS_CMD_SETTING			0xb4
@@ -152,33 +154,22 @@ struct cmd_start_acquisition {
 static int command_get_fw_version(libusb_device_handle *devhdl,
 				  struct version_info *vi)
 {
-	int ret;
+	struct ctl_rd_cmd rd_cmd;
 
-	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-		LIBUSB_ENDPOINT_IN, DS_CMD_GET_FW_VERSION, 0x0000, 0x0000,
-		(unsigned char *)vi, sizeof(struct version_info), USB_TIMEOUT);
+	/* The DSView FX2 firmware reports its version through the fork's
+	 * control-read protocol (DSL_CTL_FW_VERSION), NOT through upstream's
+	 * 0xb0 request. 0xb0 is CMD_CTL_WR in the fork protocol, so an IN
+	 * transfer on it stalls and every open fails with "Unable to get
+	 * version info". Mirrors the reference driver (PXView_v1.49
+	 * dsl.c:351-363), which reads the same two bytes with command_ctl_rd(). */
+	memset(&rd_cmd, 0, sizeof(rd_cmd));
+	rd_cmd.header.dest = DSL_CTL_FW_VERSION;
+	rd_cmd.header.offset = 0;
+	rd_cmd.header.size = sizeof(struct version_info);
+	rd_cmd.data = (uint8_t *)vi;
 
-	if (ret < 0) {
-		sr_err("Unable to get version info: %s.",
-		       libusb_error_name(ret));
-		return SR_ERR;
-	}
-
-	return SR_OK;
-}
-
-static int command_get_revid_version(struct sr_dev_inst *sdi, uint8_t *revid)
-{
-	struct sr_usb_dev_inst *usb = sdi->conn;
-	libusb_device_handle *devhdl = usb->devhdl;
-	int ret;
-
-	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-		LIBUSB_ENDPOINT_IN, DS_CMD_GET_REVID_VERSION, 0x0000, 0x0000,
-		revid, 1, USB_TIMEOUT);
-
-	if (ret < 0) {
-		sr_err("Unable to get REVID: %s.", libusb_error_name(ret));
+	if (command_ctl_rd(devhdl, rd_cmd) != SR_OK) {
+		sr_err("Unable to get version info.");
 		return SR_ERR;
 	}
 
@@ -1321,7 +1312,6 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 	struct drv_context *drvc;
 	struct version_info vi;
 	int ret = SR_ERR, i, device_count;
-	uint8_t revid;
 	char connection_id[64];
 
 	drvc = di->context;
@@ -1384,12 +1374,6 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 			break;
 		}
 
-		ret = command_get_revid_version(sdi, &revid);
-		if (ret != SR_OK) {
-			sr_err("Failed to get REVID.");
-			break;
-		}
-
 		/*
 		 * Changes in major version mean incompatible/API changes, so
 		 * bail out if we encounter an incompatible version.
@@ -1407,9 +1391,6 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 			"interface %d, firmware %d.%d.",
 			usb->bus, usb->address, connection_id,
 			USB_INTERFACE, vi.major, vi.minor);
-
-		sr_info("Detected REVID=%d, it's a Cypress CY7C68013%s.",
-			revid, (revid != 1) ? " (FX2)" : "A (FX2LP)");
 
 		ret = SR_OK;
 
