@@ -550,10 +550,17 @@ static void spi_get_bits(uint32_t bit_idx, uint32_t bit_phase,
 	} else {
 		/* During SCLK low: hold previous value for the first SPB/8
 		 * samples, then adopt the new bit (edge happens mid-low). */
+		/* These are *single level bits*, not byte-wide masks. Using 0xFF
+		 * as the "previous bit" sentinel for the first bit of a byte made
+		 * mixed_get_sample() shift 8 set bits into ch4..ch12 for the
+		 * SPB/8 hold window — a 5-sample high pulse on 9 unrelated
+		 * channels at every SPI byte boundary (every 8 * SPI_SPB
+		 * samples). mixed_get_sample() now masks every level with & 1u
+		 * as well, so no generator can corrupt neighbouring channels. */
 		uint8_t prev_mosi = (bit_in_byte < 7)
-			? ((mosi_byte >> (bit_in_byte + 1)) & 1) : 0xFF;
+			? ((mosi_byte >> (bit_in_byte + 1)) & 1) : 1;
 		uint8_t prev_miso = (bit_in_byte < 7)
-			? ((miso_byte >> (bit_in_byte + 1)) & 1) : 0xFF;
+			? ((miso_byte >> (bit_in_byte + 1)) & 1) : 1;
 		*mosi = in_hold ? prev_mosi : mosi_bit;
 		*miso = in_hold ? prev_miso : miso_bit;
 	}
@@ -590,7 +597,7 @@ static uint8_t uart_get_rx_bit(uint32_t bit_idx, uint32_t bit_phase,
 	return (rx_data >> bit_in_byte) & 1;
 }
 
-/* CAN frame: simplified CAN 2.0 standard frame, 63 bits.
+/* CAN 2.0 standard frame, 63 logical (unstuffed) bits:
  * bit 0:      SOF (dominant/0)
  * bits 1-11:  Identifier (11 bits, MSB first)
  * bit 12:     RTR (0=data)
@@ -604,17 +611,24 @@ static uint8_t uart_get_rx_bit(uint32_t bit_idx, uint32_t bit_phase,
  * bit 52:     ACK delimiter (1)
  * bits 53-59: EOF (7 bits, all 1)
  * bits 60-62: IFS (3 bits, all 1)
- * No bit stuffing (data uses 0xAA/0x55 to avoid long runs). */
-#define CAN_FRAME_BITS 63
+ *
+ * NRZ bit stuffing applies from SOF through the last CRC-sequence bit
+ * (logical bits 0..49): after five consecutive identical bits a complementary
+ * stuff bit is inserted. CRC delimiter / ACK / EOF / IFS are NOT stuffed. The
+ * sigrok can / can-fd decoders check rawbits[-6:] for exactly this pattern and
+ * drop the sixth bit; without stuffing, any five-run in the identifier or
+ * control field made them report a stuff error.
+ *
+ * Each frame occupies a fixed number of physical bit times; the unused tail is
+ * recessive (bus idle), giving a clean inter-frame gap. The 50 stuffable bits
+ * can add at most 10 stuff bits, so 63 + 10 = 73 < 80. */
+#define CAN_RAW_FRAME_BITS		63
+#define CAN_STUFF_END_BIT		49
+#define CAN_STUFFED_FRAME_BITS		80
 
-static uint8_t can_get_bit(uint32_t bit_idx, uint32_t bit_phase,
-	uint32_t bittime, uint32_t can_id_offset)
+static uint8_t can_raw_bit(uint32_t frame_bit, uint32_t frame_num)
 {
-	uint32_t frame_bit = bit_idx % CAN_FRAME_BITS;
-	uint32_t frame_num = bit_idx / CAN_FRAME_BITS;
-	uint16_t can_id = (uint16_t)(0x100 + ((frame_num + can_id_offset) & 0x3FF));
-	(void)bit_phase;
-	(void)bittime;
+	uint16_t can_id = (uint16_t)(0x100 + (frame_num & 0x3FF));
 
 	if (frame_bit == 0)
 		return 0; /* SOF */
@@ -643,6 +657,45 @@ static uint8_t can_get_bit(uint32_t bit_idx, uint32_t bit_phase,
 	if (frame_bit == 51) return 0; /* ACK slot */
 	if (frame_bit == 52) return 1; /* ACK delimiter */
 	return 1; /* EOF + IFS (bits 53-62) */
+}
+
+static uint8_t can_get_bit(uint32_t bit_idx, uint32_t bit_phase,
+	uint32_t bittime, uint32_t can_id_offset)
+{
+	const uint32_t frame_num = bit_idx / CAN_STUFFED_FRAME_BITS;
+	const uint32_t pos = bit_idx % CAN_STUFFED_FRAME_BITS;
+	uint8_t bits[CAN_STUFFED_FRAME_BITS];
+	uint32_t out = 0;
+	uint32_t i;
+	int run = 0;
+	uint8_t last = 0;
+
+	(void)bit_phase;
+	(void)bittime;
+
+	for (i = 0; i < CAN_RAW_FRAME_BITS && out < CAN_STUFFED_FRAME_BITS; i++) {
+		uint8_t b = can_raw_bit(i, frame_num + can_id_offset);
+
+		if (i > CAN_STUFF_END_BIT) {
+			/* CRC delimiter onwards: no stuffing, restart the run. */
+			bits[out++] = b;
+			run = 0;
+			continue;
+		}
+		if (run >= 5) {
+			uint8_t stuff = (uint8_t)(last ^ 1);
+			bits[out++] = stuff;
+			run = 1;
+			last = stuff;
+		}
+		bits[out++] = b;
+		run = (run > 0 && b == last) ? run + 1 : 1;
+		last = b;
+	}
+	while (out < CAN_STUFFED_FRAME_BITS)
+		bits[out++] = 1; /* recessive inter-frame gap */
+
+	return bits[pos];
 }
 
 /* JTAG cycle: 19 bit times.
@@ -781,20 +834,29 @@ static void i2s_get_bits(uint32_t bit_idx, uint32_t bit_phase,
 }
 
 /* MIPI DSI LP data frame: 44 bit times.
+ * The state sequence is matched to the MIPI_DSI decoder state machine
+ * (libsigrokdecode/decoders/mipi_dsi/pd.py), not just to the D-PHY spec:
+ *   FIND START wants D0N falling while D0P is high (LP-11 -> LP-01);
+ *   FIND MODE samples D0N on the LP-10/LP-01 state: 1 = ESC, 0 = BTA;
+ *   FIND DATA consumes one LP-10/LP-01 edge followed by LP-00 (data bit)
+ *   or LP-11 (STOP). A bare LP-11 after the last data bit is NOT seen as a
+ *   stop, because the decoder is still waiting for the next edge.
+ *
  * LP states (D0N, D0P):
  *   LP-11 (1,1): idle / stop
- *   LP-01 (0,1): start, escape mode, data bit=1 edge
- *   LP-10 (1,0): data bit=0 edge
+ *   LP-01 (0,1): start, data bit=1 edge, exit edge
+ *   LP-10 (1,0): Escape Mode entry, data bit=0 edge
  *   LP-00 (0,0): turnaround, data valid
  *
  * Frame layout:
  *   bits 0-3:  LP-11 (idle)
  *   bit  4:    LP-01 (start — D0N falls while D0P high)
  *   bit  5:    LP-00 (turnaround)
- *   bit  6:    LP-01 (escape mode select)
+ *   bit  6:    LP-10 (Escape Mode entry; LP-01 here decodes as BTA)
  *   bit  7:    LP-00 (turnaround)
  *   bits 8-39: 2 bytes data, LSB first, each bit = 2 states (edge + valid)
- *   bits 40-43: LP-11 (stop) */
+ *   bit  40:   LP-01 (exit edge, lets the decoder recognise STOP)
+ *   bits 41-43: LP-11 (stop) */
 #define MIPI_DSI_FRAME_BITS 44
 #define MIPI_DSI_DATA_BYTES 2
 
@@ -817,8 +879,10 @@ static void mipi_dsi_get_bits(uint32_t bit_idx, uint32_t bit_phase,
 		/* Turnaround: LP-00 */
 		*d0n = 0; *d0p = 0;
 	} else if (frame_bit == 6) {
-		/* Escape mode: LP-01 */
-		*d0n = 0; *d0p = 1;
+		/* Escape Mode entry: LP-10. The decoder latches D0N on this
+		 * state (d0n=1 -> "ESC Mode", d0n=0 -> "BTA"), so LP-01 here
+		 * would mislabel every frame as a bus turnaround. */
+		*d0n = 1; *d0p = 0;
 	} else if (frame_bit == 7) {
 		/* Turnaround: LP-00 */
 		*d0n = 0; *d0p = 0;
@@ -847,6 +911,13 @@ static void mipi_dsi_get_bits(uint32_t bit_idx, uint32_t bit_phase,
 				*d0n = 1; *d0p = 0;
 			}
 		}
+	} else if (frame_bit == 40) {
+		/* Exit edge. In FIND DATA the decoder first waits for an
+		 * LP-10/LP-01 edge and then for LP-00 (data) or LP-11 (stop).
+		 * Without this edge the trailing LP-11 is skipped and the next
+		 * frame's header gets consumed as data bits, corrupting every
+		 * subsequent frame boundary. */
+		*d0n = 0; *d0p = 1;
 	} else {
 		/* Stop: LP-11 */
 		*d0n = 1; *d0p = 1;
@@ -881,63 +952,69 @@ static uint32_t mixed_get_sample(uint32_t bit_idx, uint32_t bit_phase,
 	 * phase offset so edges never align across buses. */
 	uint32_t step = sample_idx;
 
+	/* Every generator returns ONE level bit. Mask it before shifting:
+	 * a stray byte-wide value (0xFF "idle high" sentinel) would otherwise
+	 * set up to 8 adjacent channel bits at once. */
+#define MIXED_LEVEL(x) ((uint32_t)((x) & 1u))
+
 	/* I2C: ch0=SCL, ch1=SDA */
 	{
 		uint8_t scl, sda;
 		uint32_t p = (step + 0) % I2C_SPB;
 		i2c_get_bit((step + 0) / I2C_SPB, p, I2C_SPB, &scl, &sda);
-		val |= (uint32_t)scl << 0;
-		val |= (uint32_t)sda << 1;
+		val |= MIXED_LEVEL(scl) << 0;
+		val |= MIXED_LEVEL(sda) << 1;
 	}
 	/* SPI: ch2=CS, ch3=SCLK, ch4=MOSI, ch5=MISO */
 	{
 		uint8_t cs, sclk, mosi, miso;
 		uint32_t p = (step + 7) % SPI_SPB;
 		spi_get_bits((step + 7) / SPI_SPB, p, SPI_SPB, 0, &cs, &sclk, &mosi, &miso);
-		val |= (uint32_t)cs << 2;
-		val |= (uint32_t)sclk << 3;
-		val |= (uint32_t)mosi << 4;
-		val |= (uint32_t)miso << 5;
+		val |= MIXED_LEVEL(cs) << 2;
+		val |= MIXED_LEVEL(sclk) << 3;
+		val |= MIXED_LEVEL(mosi) << 4;
+		val |= MIXED_LEVEL(miso) << 5;
 	}
 	/* UART: ch6=RX */
 	{
 		uint32_t p = (step + 13) % UART_SPB;
-		val |= (uint32_t)uart_get_rx_bit((step + 13) / UART_SPB, p,
-			UART_SPB, 0) << 6;
+		val |= MIXED_LEVEL(uart_get_rx_bit((step + 13) / UART_SPB, p,
+			UART_SPB, 0)) << 6;
 	}
 	/* CAN: ch7=RX */
 	{
 		uint32_t p = (step + 19) % CAN_SPB;
-		val |= (uint32_t)can_get_bit((step + 19) / CAN_SPB, p,
-			CAN_SPB, 0) << 7;
+		val |= MIXED_LEVEL(can_get_bit((step + 19) / CAN_SPB, p,
+			CAN_SPB, 0)) << 7;
 	}
 	/* PWM: ch8=DATA */
-	val |= (uint32_t)pwm_mixed_get_bit(sample_idx) << 8;
+	val |= MIXED_LEVEL(pwm_mixed_get_bit(sample_idx)) << 8;
 	/* I2S: ch9=SCK, ch10=WS, ch11=SD */
 	{
 		uint8_t sck, ws, sd;
 		uint32_t p = (step + 23) % I2S_SPB;
 		i2s_get_bits((step + 23) / I2S_SPB, p, I2S_SPB, 0, &sck, &ws, &sd);
-		val |= (uint32_t)sck << 9;
-		val |= (uint32_t)ws << 10;
-		val |= (uint32_t)sd << 11;
+		val |= MIXED_LEVEL(sck) << 9;
+		val |= MIXED_LEVEL(ws) << 10;
+		val |= MIXED_LEVEL(sd) << 11;
 	}
 	/* MIPI DSI: ch12=D0N, ch13=D0P */
 	{
 		uint8_t d0n, d0p;
 		uint32_t p = (step + 29) % MIPI_SPB;
 		mipi_dsi_get_bits((step + 29) / MIPI_SPB, p, MIPI_SPB, 0, &d0n, &d0p);
-		val |= (uint32_t)d0n << 12;
-		val |= (uint32_t)d0p << 13;
+		val |= MIXED_LEVEL(d0n) << 12;
+		val |= MIXED_LEVEL(d0p) << 13;
 	}
 	/* SWD: ch14=SWDIO, ch15=SWCLK */
 	{
 		uint8_t swdio, swclk;
 		uint32_t p = (step + 31) % SWD_SPB;
 		swd_get_bits((step + 31) / SWD_SPB, p, SWD_SPB, 0, &swdio, &swclk);
-		val |= (uint32_t)swdio << 14;
-		val |= (uint32_t)swclk << 15;
+		val |= MIXED_LEVEL(swdio) << 14;
+		val |= MIXED_LEVEL(swclk) << 15;
 	}
+#undef MIXED_LEVEL
 
 	/* Mirror ch0-15 to ch16-31 so all 32 channels have data. */
 	val |= (val & 0xFFFF) << 16;

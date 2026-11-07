@@ -143,26 +143,27 @@ enum logic_pattern_type {
 	PATTERN_I2C,
 
 	/**
-	 * Mixed protocol pattern: fills all 32 logic channels with
-	 * 7 protocol types and 16 bus instances.
+	 * Mixed protocol pattern: 8 independent protocol buses packed into
+	 * ch0-15, mirrored to ch16-31 so all 32 logic channels carry data.
+	 * mixed_get_sample() in protocol.c is the authoritative layout.
 	 *
-	 * Channel layout:
-	 *   ch0-1:   I2C #0 (SCL, SDA)
-	 *   ch2-3:   I2C #1 (SCL, SDA)
-	 *   ch4-7:   SPI #0 (CS, SCLK, MOSI, MISO)
-	 *   ch8-11:  SPI #1
-	 *   ch12-15: SPI #2
-	 *   ch16:    UART #0 RX
-	 *   ch17:    UART #1 RX
-	 *   ch18:    CAN #0 RX
-	 *   ch19:    CAN #1 RX
-	 *   ch20-22: JTAG shared (TCK, TMS, TDI)
-	 *   ch23-26: JTAG TDO #0-3
-	 *   ch27-28: SWD #0 (SWDIO, SWCLK)
-	 *   ch29-30: SWD #1
-	 *   ch31:    PWM
+	 * Channel layout (bit N of the sample = chN):
+	 *   ch0-1:   I2C      (SCL, SDA)
+	 *   ch2-5:   SPI      (CS, SCLK, MOSI, MISO)
+	 *   ch6:     UART     (RX)
+	 *   ch7:     CAN      (RX)
+	 *   ch8:     PWM      (DATA)
+	 *   ch9-11:  I2S      (SCK, WS, SD)
+	 *   ch12-13: MIPI DSI (D0N, D0P)
+	 *   ch14-15: SWD      (SWDIO, SWCLK)
+	 *   ch16-31: mirror of ch0-15
 	 *
-	 * 16 C decoders: 2 I2C + 3 SPI + 2 UART + 2 CAN + 4 JTAG + 2 SWD + 1 PWM
+	 * Each bus uses its own samples-per-bit timebase (I2C_SPB ...
+	 * MIPI_SPB above) and a per-bus phase offset, so bit boundaries
+	 * do not align across buses. Every generator must return a single
+	 * level bit (0/1): mixed_get_sample() masks it with & 1u before
+	 * shifting, so a byte-wide value cannot leak into neighbouring
+	 * channels.
 	 */
 	PATTERN_MIXED,
 };
