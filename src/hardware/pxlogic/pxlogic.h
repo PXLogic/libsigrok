@@ -411,9 +411,13 @@ static const int32_t sessions[] = {
     SR_CONF_PWM0_EN,
     SR_CONF_PWM0_FREQ,
     SR_CONF_PWM0_DUTY,
-    SR_CONF_PWM1_EN,
-    SR_CONF_PWM1_FREQ,
-    SR_CONF_PWM1_DUTY,
+    /* PWM1 keys are not advertised in devopts[] (see note there), so
+     * hwdriver.c check_key() rejects get/set on them. Keeping them in the
+     * session list would make config_io.cpp query/restore three unreachable
+     * keys on every .pxc save/load. */
+    // SR_CONF_PWM1_EN,
+    // SR_CONF_PWM1_FREQ,
+    // SR_CONF_PWM1_DUTY,
 };
 
 /* STD_CONFIG_LIST arrays. Carrying SR_CONF_GET|SET|LIST capability bits
@@ -451,15 +455,19 @@ static const uint32_t devopts[] = {
     SR_CONF_TRIGGER_ADV_ENABLE | SR_CONF_GET | SR_CONF_SET,
     SR_CONF_TRIGGER_ADV_STAGES | SR_CONF_GET | SR_CONF_SET,
     SR_CONF_TRIGGER_ADV_CONFIG | SR_CONF_GET | SR_CONF_SET,
-    /* PWM0/PWM1 输出配置：驱动 config_get/set 已实现，UI 通过
-     * deviceoptions.cpp 的 switch case 渲染为控件。PWM1 在旧版中被
-     * 注释掉，新版按用户需求一并暴露。 */
+    /* PWM0 输出配置：驱动 config_get/set 已实现，UI 通过
+     * deviceoptions.cpp 的 switch case 渲染为控件。
+     * PWM1 (EN/FREQ/DUTY) 不在此声明 —— DeviceOptionsDock 的控件是按本数组
+     * 返回的 key 逐个生成的，不声明就不显示。
+     * 原因：PWM1 硬件走线靠近 DDR 时钟，开启后会干扰 DDR，沿用旧版
+     * 「只有 PWM0 可以开启」的行为。pxlogic.c 中 PWM1 的 config_get/set
+     * 分支与 devc 字段全部保留，需要恢复时把下面三行放回来即可。 */
     SR_CONF_PWM0_EN         | SR_CONF_GET | SR_CONF_SET,
     SR_CONF_PWM0_FREQ       | SR_CONF_GET | SR_CONF_SET,
     SR_CONF_PWM0_DUTY       | SR_CONF_GET | SR_CONF_SET,
-    SR_CONF_PWM1_EN         | SR_CONF_GET | SR_CONF_SET,
-    SR_CONF_PWM1_FREQ       | SR_CONF_GET | SR_CONF_SET,
-    SR_CONF_PWM1_DUTY       | SR_CONF_GET | SR_CONF_SET,
+    // SR_CONF_PWM1_EN         | SR_CONF_GET | SR_CONF_SET,
+    // SR_CONF_PWM1_FREQ       | SR_CONF_GET | SR_CONF_SET,
+    // SR_CONF_PWM1_DUTY       | SR_CONF_GET | SR_CONF_SET,
     /* PXView-local: read-only trigger sample position (uint64). Exposed so
      * the app can place the trigger cursor after SR_DF_TRIGGER (which has
      * no payload upstream). See config_get case SR_CONF_TRIGGER_POS. */
