@@ -1140,8 +1140,18 @@ SR_PRIV int ch32h417_acquisition_start(const struct sr_dev_inst *sdi)
 			sizeof(float) * devc->limit_samples);
 	}
 
+	/* PXView 每次开始采集都会同步一份（可能为空的）trigger，于是
+	 * sr_session_trigger_get() 返回非 NULL 的空 GSList。原逻辑只看指针非空
+	 * 就进软触发分支并置 trigger_fired = FALSE，而空 trigger 永不匹配，结果是
+	 * 第二次及以后的采集一包数据都不发（实测只有首次采集有数据）。
+	 * 这里：1) 每次采集重置 sent_samples / num_frames，避免沿用上一轮残值；
+	 *       2) trigger 为空列表时视为无触发，直接 trigger_fired = TRUE。 */
+	devc->sent_samples = 0;
+	devc->num_frames = 0;
+
 	/* 设置触发 */
-	if ((trigger = sr_session_trigger_get(sdi->session)))
+	if ((trigger = sr_session_trigger_get(sdi->session)) &&
+	    g_slist_length(trigger) > 0)
 	{
 		int pre_trigger_samples = 0;
 		if (devc->limit_samples > 0)
